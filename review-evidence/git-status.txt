@@ -1,3 +1,1 @@
-?? ../docs/
-?? ../review-evidence/
-?? ./
+ M review-evidence/git-status.txt

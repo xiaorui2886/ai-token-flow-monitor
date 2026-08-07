@@ -1,1 +1,3 @@
-fatal: your current branch 'main' does not have any commits yet
+5de8397 fix(core): apply PR #2 final patch review fixes for TPS, handoff, and accuracy restoration
+daef54a core: implement core metering final correctness closure fixes (P0-1 to P1-3)
+0930e98 core: establish verified token metering engine baseline
