@@ -33,6 +33,7 @@ impl CrossSourceReconciler {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn restore_state(
         &mut self,
         request_key: RequestCorrelationKey,
@@ -40,6 +41,8 @@ impl CrossSourceReconciler {
         token_acc: TokenAccuracy,
         temp_acc: TemporalAccuracy,
         priority: u8,
+        contributed_context_input: u64,
+        contributed_output: u64,
     ) {
         self.request_active_sources.insert(
             request_key,
@@ -48,8 +51,8 @@ impl CrossSourceReconciler {
                 token_accuracy: token_acc,
                 temporal_accuracy: temp_acc,
                 priority,
-                contributed_context_input: 0,
-                contributed_output: 0,
+                contributed_context_input,
+                contributed_output,
             },
         );
     }
@@ -89,7 +92,7 @@ impl CrossSourceReconciler {
                 active.temporal_accuracy,
                 active.priority,
             ) {
-                // Source Handoff Reconciliation: Handoff baseline alignment (P0-2 & Fix 5)
+                // Source Handoff Reconciliation: Handoff baseline alignment (P0-2 & Fix 5 & Fix 3 AP)
                 let mut adjusted_delta = delta.clone();
 
                 let prev_c_in = active.contributed_context_input;

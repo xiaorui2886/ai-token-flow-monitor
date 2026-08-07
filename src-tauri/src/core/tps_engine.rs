@@ -29,7 +29,7 @@ pub struct AgentTpsMetrics {
 pub struct TPSEngine {
     agent_buffers: HashMap<String, VecDeque<TokenSampleRecord>>,
     agent_peaks: HashMap<String, f64>,
-    agent_last_in_metrics: HashMap<String, (Option<f64>, InputThroughputMetric)>,
+    agent_last_in_metrics: HashMap<String, (String, u64, Option<f64>, InputThroughputMetric)>,
     agent_interval_metrics: HashMap<String, IntervalAverageMetric>,
     global_peak: f64,
 }
@@ -87,7 +87,7 @@ impl TPSEngine {
             );
         }
 
-        // P0-3: Compute & store InputThroughputMetric
+        // Fix 4: Compute & store InputThroughputMetric with freshness timestamp (ns)
         let in_metric = self.compute_input_metric(delta);
         let in_tps_val = match in_metric {
             InputThroughputMetric::PrefillExact(v) => Some(v),
@@ -95,8 +95,15 @@ impl TPSEngine {
             InputThroughputMetric::Unavailable => None,
         };
         if in_tps_val.is_some() {
-            self.agent_last_in_metrics
-                .insert(delta.agent_id.clone(), (in_tps_val, in_metric));
+            self.agent_last_in_metrics.insert(
+                delta.agent_id.clone(),
+                (
+                    delta.collector_run_id.clone(),
+                    delta.observed_monotonic_ns,
+                    in_tps_val,
+                    in_metric,
+                ),
+            );
         }
 
         let buffer = self
@@ -137,7 +144,7 @@ impl TPSEngine {
                 continue;
             }
             if current_monotonic_ns.saturating_sub(r.monotonic_ns) <= window_1s_ns {
-                // P0-1: ONLY StreamExact with GapState::Normal and not TokenizerEstimate can enter Instant 1s Live OUT TPS!
+                // P0-1 & Fix 5: ONLY StreamExact with GapState::Normal and not TokenizerEstimate can enter Instant 1s Live OUT TPS!
                 if r.temporal_accuracy != TemporalAccuracy::StreamExact {
                     continue;
                 }
@@ -155,12 +162,22 @@ impl TPSEngine {
 
         let current_out_tps = out_1s_tokens as f64;
 
-        // Calculate 5s average OUT TPS
+        // Fix 5: Calculate 5s Live Average using Live Eligibility ONLY (StreamExact, GapState::Normal, not TokenizerEstimate)
         let mut out_5s_tokens = 0u64;
         let mut oldest_ns = current_monotonic_ns;
 
         for r in buffer.iter() {
             if r.collector_run_id == current_run_id {
+                if r.temporal_accuracy != TemporalAccuracy::StreamExact {
+                    continue;
+                }
+                if r.gap_state != GapState::Normal {
+                    continue;
+                }
+                if r.measurement_kind == MeasurementKind::TokenizerEstimate {
+                    continue;
+                }
+
                 out_5s_tokens += r.delta_out;
                 if r.monotonic_ns < oldest_ns {
                     oldest_ns = r.monotonic_ns;
@@ -177,11 +194,19 @@ impl TPSEngine {
             *peak = current_out_tps;
         }
 
-        let (in_val, in_metric) = self
-            .agent_last_in_metrics
-            .get(agent_id)
-            .cloned()
-            .unwrap_or((None, InputThroughputMetric::Unavailable));
+        // Fix 4: Current IN TPS Freshness window (1 second = 1_000_000_000 ns)
+        let (in_val, in_metric) = if let Some((run_id, ns, val, metric)) =
+            self.agent_last_in_metrics.get(agent_id)
+        {
+            if run_id == current_run_id && current_monotonic_ns.saturating_sub(*ns) <= 1_000_000_000
+            {
+                (*val, metric.clone())
+            } else {
+                (None, InputThroughputMetric::Unavailable)
+            }
+        } else {
+            (None, InputThroughputMetric::Unavailable)
+        };
 
         let interval_metric = self.agent_interval_metrics.get(agent_id).cloned();
 

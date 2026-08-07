@@ -2239,7 +2239,6 @@ fn test_aj_true_mixed_accuracy_coverage() {
     let mut pipeline = create_test_pipeline("run_aj");
     let semantics = generic_semantics();
 
-    // Codex: Exact + StreamExact + 60
     let mock_codex = MockAdapter::new("run_aj");
     let s_codex = mock_codex.create_sample(
         "codex",
@@ -2260,7 +2259,6 @@ fn test_aj_true_mixed_accuracy_coverage() {
         10,
     );
 
-    // Claude: Exact + TurnExact + 50
     let mock_claude = MockAdapter::new("run_aj");
     let mut s_claude = mock_claude.create_sample(
         "claude",
@@ -2342,7 +2340,6 @@ fn test_al_finalized_request_excluded_from_instant_tps() {
     let mock = MockAdapter::new("run_al");
     let semantics = generic_semantics();
 
-    // Finalize request at 196
     let s_final = mock.create_sample(
         "codex",
         "Codex",
@@ -2365,7 +2362,6 @@ fn test_al_finalized_request_excluded_from_instant_tps() {
         .process_sample(&s_final, &semantics, BaselineMode::KnownZeroOrigin)
         .unwrap();
 
-    // Late snapshot 180 on finalized request
     let s_late = mock.create_sample(
         "codex",
         "Codex",
@@ -2375,10 +2371,10 @@ fn test_al_finalized_request_excluded_from_instant_tps() {
         None,
         2_000_000_000,
         2000,
-        EventKind::Snapshot,
-        true,
+        EventKind::Delta,
+        false,
         0,
-        180,
+        50,
         0,
         0,
         0,
@@ -2393,9 +2389,20 @@ fn test_al_finalized_request_excluded_from_instant_tps() {
         .calculate_agent_tps("codex", 2_000_000_000, "run_al");
     assert_eq!(
         metrics.current_out_tps, 0.0,
-        "Late snapshot on finalized request must NOT enter Instant OUT TPS!"
+        "Late delta on finalized request must NOT enter Instant OUT TPS!"
     );
-    println!("FINALIZED REQUEST EXCLUDED FROM INSTANT TPS = PASS");
+
+    let ledger = pipeline
+        .request_ledger
+        .get_ledger(&RequestCorrelationKey {
+            agent_id: "codex".to_string(),
+            session_id: "sess_al".to_string(),
+            request_id: "req_al".to_string(),
+        })
+        .unwrap();
+
+    assert_eq!(ledger.canonical_output_total, 196);
+    println!("FINALIZED STREAM DELTA SUPPRESSION = PASS");
 }
 
 #[test]
@@ -2403,7 +2410,6 @@ fn test_am_source_handoff_uncertainty() {
     let mut pipeline = create_test_pipeline("run_am");
     let semantics = generic_semantics();
 
-    // Source A: 100 tokens (Priority 5)
     let mock_a = MockAdapter::new("run_am");
     let s_a = mock_a.create_sample_with_native(
         "codex",
@@ -2429,7 +2435,6 @@ fn test_am_source_handoff_uncertainty() {
         .process_sample(&s_a, &semantics, BaselineMode::KnownZeroOrigin)
         .unwrap();
 
-    // Source B (High Priority 10) arrives with 80 tokens (< previous 100 contribution)
     let mock_b = MockAdapter::new("run_am");
     let s_b = mock_b.create_sample_with_native(
         "codex",
@@ -2473,7 +2478,226 @@ fn test_am_source_handoff_uncertainty() {
         .unwrap();
 
     assert_eq!(ledger.canonical_output_total, 100, "Total must remain 100!");
-    println!("SOURCE HANDOFF UNCERTAINTY = PASS");
+    println!("UNCERTAIN HANDOFF FOLLOW-UP = PASS");
+}
+
+#[test]
+fn test_ap_restart_handoff_cursor() {
+    let temp_db_path = std::env::temp_dir().join(format!("test_ap_{}.db", uuid::Uuid::new_v4()));
+
+    {
+        let storage = Arc::new(Mutex::new(StorageManager::new_file(&temp_db_path).unwrap()));
+        let mut p1 = EnginePipeline::new("run_ap1", storage).unwrap();
+        let mock_a = MockAdapter::new("run_ap1");
+        let semantics = generic_semantics();
+
+        let s_a = mock_a.create_sample_with_native(
+            "codex",
+            "Codex",
+            "gpt-4o",
+            "sess_ap",
+            Some("req_ap"),
+            None,
+            1_000_000_000,
+            1000,
+            EventKind::Snapshot,
+            true,
+            0,
+            100,
+            0,
+            0,
+            0,
+            5,
+            SourceNativeIdentity::default(),
+            "source_a".to_string(),
+        );
+        p1.process_sample(&s_a, &semantics, BaselineMode::KnownZeroOrigin)
+            .unwrap();
+    }
+
+    {
+        let storage2 = Arc::new(Mutex::new(StorageManager::new_file(&temp_db_path).unwrap()));
+        let mut p2 = EnginePipeline::new("run_ap2", storage2.clone()).unwrap();
+        let mock_b = MockAdapter::new("run_ap2");
+        let semantics = generic_semantics();
+
+        let s_b = mock_b.create_sample_with_native(
+            "codex",
+            "Codex",
+            "gpt-4o",
+            "sess_ap",
+            Some("req_ap"),
+            None,
+            2_000_000_000,
+            2000,
+            EventKind::Snapshot,
+            true,
+            0,
+            120,
+            0,
+            0,
+            0,
+            10,
+            SourceNativeIdentity::default(),
+            "source_b".to_string(),
+        );
+
+        p2.process_sample(&s_b, &semantics, BaselineMode::KnownZeroOrigin)
+            .unwrap();
+
+        let total = storage2.lock().get_total_output_tokens("codex").unwrap();
+        assert_eq!(
+            total, 120,
+            "Restart handoff from 100 to 120 must equal 120, NOT 220!"
+        );
+    }
+    let _ = std::fs::remove_file(temp_db_path);
+    println!("RESTART HANDOFF CURSOR = PASS");
+}
+
+#[test]
+fn test_aq_in_tps_freshness() {
+    let mut pipeline = create_test_pipeline("run_aq");
+    let mock = MockAdapter::new("run_aq");
+    let semantics = generic_semantics();
+
+    let sample = RawSourceSample {
+        timing: TimingInfo {
+            request_start_ms: Some(1000),
+            first_token_ms: Some(1500),
+            ..Default::default()
+        },
+        ..mock.create_sample(
+            "codex",
+            "Codex",
+            "gpt-4o",
+            "sess_aq",
+            Some("req_aq"),
+            None,
+            1_000_000_000,
+            1000,
+            EventKind::Delta,
+            false,
+            20000,
+            10,
+            0,
+            0,
+            0,
+            1,
+        )
+    };
+
+    pipeline
+        .process_sample(&sample, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    let m1 = pipeline.global_aggregator.compute_global_metrics(
+        &mut pipeline.tps_engine,
+        1_000_000_000,
+        "run_aq",
+    );
+    assert_eq!(m1.global_in_tps, Some(40000.0));
+
+    // After 3 seconds (3_000_000_000 ns elapsed without new input event)
+    let m3 = pipeline.global_aggregator.compute_global_metrics(
+        &mut pipeline.tps_engine,
+        4_000_000_000,
+        "run_aq",
+    );
+    assert_eq!(
+        m3.global_in_tps, None,
+        "Current IN TPS must expire after 1s freshness window!"
+    );
+    println!("IN TPS FRESHNESS = PASS");
+}
+
+#[test]
+fn test_ar_5s_live_eligibility() {
+    let mut pipeline = create_test_pipeline("run_ar");
+    let mock = MockAdapter::new("run_ar");
+    let semantics = generic_semantics();
+
+    // StreamExact = 50
+    let s_stream = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_ar",
+        Some("req_ar1"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Delta,
+        false,
+        0,
+        50,
+        0,
+        0,
+        0,
+        1,
+    );
+
+    // IntervalExact = 200
+    let mut s_interval = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_ar",
+        Some("req_ar2"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Snapshot,
+        true,
+        0,
+        200,
+        0,
+        0,
+        0,
+        1,
+    );
+    s_interval.temporal_accuracy = TemporalAccuracy::IntervalExact;
+    s_interval.timing.measurement_interval_ms = Some(2000);
+
+    pipeline
+        .process_sample(&s_stream, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+    pipeline
+        .process_sample(&s_interval, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    let metrics = pipeline
+        .tps_engine
+        .calculate_agent_tps("codex", 1_000_000_000, "run_ar");
+
+    assert_eq!(
+        metrics.avg_5s_out_tps, 50.0,
+        "5s Live Average must ONLY include StreamExact (50.0 t/s), NOT 250.0 t/s!"
+    );
+    println!("5S LIVE ELIGIBILITY = PASS");
+}
+
+#[test]
+fn test_as_schema_upgrade_policy() {
+    let temp_db_path = std::env::temp_dir().join(format!("test_as_{}.db", uuid::Uuid::new_v4()));
+    {
+        let conn = rusqlite::Connection::open(&temp_db_path).unwrap();
+        conn.execute("PRAGMA user_version = 1;", []).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE canonical_request_ledgers (
+                agent_id TEXT, session_id TEXT, request_id TEXT, PRIMARY KEY (agent_id, session_id, request_id)
+            );",
+        )
+        .unwrap();
+    }
+
+    {
+        let storage = StorageManager::new_file(&temp_db_path).unwrap();
+        let ledgers = storage.load_ledgers().unwrap();
+        assert_eq!(ledgers.len(), 0);
+    }
+    let _ = std::fs::remove_file(temp_db_path);
+    println!("SCHEMA UPGRADE POLICY = PASS");
 }
 
 #[test]
@@ -2498,7 +2722,7 @@ fn test_fix1_interval_without_duration() {
         1,
     );
     sample.temporal_accuracy = TemporalAccuracy::IntervalExact;
-    sample.timing.measurement_interval_ms = None; // No duration
+    sample.timing.measurement_interval_ms = None;
 
     let mut pipeline = create_test_pipeline("run_fix1");
     let semantics = generic_semantics();
@@ -2600,7 +2824,6 @@ fn test_fix3_correction_does_not_reset_generation() {
     );
     assert_eq!(c1.delta_output, 100);
 
-    // EventKind::Correction should NOT reset generation when counter_reset_hint = false!
     let c2 = tracker.process_counters(
         "adapter_fix3",
         &key,
@@ -2611,7 +2834,7 @@ fn test_fix3_correction_does_not_reset_generation() {
         0,
         0,
         BaselineMode::KnownZeroOrigin,
-        false, // NOT explicit reset
+        false,
     );
     assert_eq!(
         c2.delta_output, 0,

@@ -25,6 +25,58 @@ impl StorageManager {
     }
 
     pub fn init_schema(&self) -> Result<()> {
+        let mut user_ver: i32 = self
+            .conn
+            .query_row("PRAGMA user_version;", [], |r| r.get(0))
+            .unwrap_or(0);
+
+        if user_ver < 2 {
+            // Fix 7: Safe Pre-release Schema Upgrade Policy
+            // Check if old incompatible schema exists and drop development tables cleanly
+            let table_exists: bool = self
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='canonical_request_ledgers';",
+                    [],
+                    |r| r.get::<_, i32>(0),
+                )
+                .map(|c| c > 0)
+                .unwrap_or(false);
+
+            if table_exists {
+                // Inspect table columns to verify compatibility
+                let has_new_col: bool = self
+                    .conn
+                    .prepare("PRAGMA table_info(canonical_request_ledgers);")
+                    .and_then(|mut stmt| {
+                        let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+                        let mut found = false;
+                        for col in rows {
+                            if col.unwrap_or_default() == "canonical_context_input_total" {
+                                found = true;
+                                break;
+                            }
+                        }
+                        Ok(found)
+                    })
+                    .unwrap_or(false);
+
+                if !has_new_col {
+                    // Rebuild development tables for v2 schema
+                    self.conn.execute_batch(
+                        "
+                        DROP TABLE IF EXISTS canonical_token_deltas;
+                        DROP TABLE IF EXISTS canonical_corrections;
+                        DROP TABLE IF EXISTS canonical_request_ledgers;
+                        ",
+                    )?;
+                }
+            }
+
+            self.conn.execute_batch("PRAGMA user_version = 2;")?;
+            user_ver = 2;
+        }
+
         self.conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
@@ -138,6 +190,8 @@ impl StorageManager {
             );
             ",
         )?;
+
+        let _ = user_ver; // Suppress unused variable warning
         Ok(())
     }
 

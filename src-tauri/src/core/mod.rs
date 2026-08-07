@@ -56,6 +56,8 @@ impl EnginePipeline {
                         l.active_live_token_accuracy,
                         l.active_live_temporal_accuracy,
                         l.active_live_source_priority,
+                        l.canonical_context_input_total,
+                        l.canonical_output_total,
                     );
                     request_ledger.restore_ledger(l);
                 }
@@ -154,8 +156,18 @@ impl EnginePipeline {
                 .calculate(sample, &normalized, &correlation, mode)
         {
             if let Some(canonical_delta) = self.reconciler.reconcile(&raw_delta) {
+                // Check if request is already finalized (Fix 4)
+                let is_finalized = self
+                    .request_ledger
+                    .get_ledger(&canonical_delta.correlation_key)
+                    .map(|l| l.is_finalized)
+                    .unwrap_or(false);
+
                 self.request_ledger.record_live_delta(&canonical_delta);
-                self.tps_engine.push_delta(&canonical_delta);
+
+                if !is_finalized {
+                    self.tps_engine.push_delta(&canonical_delta);
+                }
 
                 let mut storage_guard = self.storage.lock();
                 if let Some(ledger) = self
