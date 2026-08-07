@@ -34,3 +34,5 @@ private-evidence/
 .DS_Store
 Thumbs.db
 LOCAL_TEST_REPORT.md
+CODEX_GROUND_TRUTH_REPORT.md
+LOCAL_CODEX_ADAPTER_REPORT.md
