@@ -57,7 +57,11 @@ impl EnginePipeline {
                         l.active_live_temporal_accuracy,
                         l.active_live_source_priority,
                         l.canonical_context_input_total,
+                        l.canonical_fresh_input_total,
                         l.canonical_output_total,
+                        l.canonical_cache_read,
+                        l.canonical_cache_write,
+                        l.canonical_reasoning,
                     );
                     request_ledger.restore_ledger(l);
                 }

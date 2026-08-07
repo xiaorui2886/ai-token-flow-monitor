@@ -48,13 +48,16 @@ impl SnapshotAccumulator {
                 delta_cache_read: normalized.cache_read_tokens,
                 delta_cache_write: normalized.cache_write_tokens,
                 delta_reasoning: normalized.reasoning_tokens,
-                delta_total: normalized.normalized_total,
+                // Multi-Field Consistency Freeze: Canonical Total = Context Input + Output (Cache/Reasoning are subsets)
+                delta_total: normalized.normalized_context_input_tokens
+                    + normalized.normalized_output_tokens,
                 baseline_mode: mode,
                 is_late_old_sample: false,
             };
         }
 
-        // Fix 3: ONLY explicit counter_reset_hint can trigger counter reset (NOT EventKind::Correction!)
+        // Cumulative snapshot mode across ALL counters (P0-1)
+        // Multi-Field Consistency Freeze: ONLY explicit counter_reset_hint triggers reset
         let is_explicit_reset = sample.counter_reset_hint;
 
         let c_deltas = self.tracker.process_counters(
@@ -70,7 +73,8 @@ impl SnapshotAccumulator {
             is_explicit_reset,
         );
 
-        let d_total = c_deltas.delta_fresh_input + c_deltas.delta_output;
+        // Multi-Field Consistency Freeze: Canonical Total = Context Input + Output (NOT Fresh Input + Output!)
+        let d_total = c_deltas.delta_context_input + c_deltas.delta_output;
 
         AccumulatedDelta {
             delta_context_input: c_deltas.delta_context_input,

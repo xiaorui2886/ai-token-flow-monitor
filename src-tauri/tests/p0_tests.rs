@@ -248,7 +248,7 @@ fn test_d1_known_epoch_restart() {
         .process_sample(&s2, &semantics, BaselineMode::KnownZeroOrigin)
         .unwrap();
 
-    let s3 = mock.create_sample(
+    let mut s3 = mock.create_sample(
         "codex",
         "Codex",
         "gpt-4o",
@@ -266,6 +266,8 @@ fn test_d1_known_epoch_restart() {
         0,
         1,
     );
+    // Multi-Field Consistency Freeze: ContinuousEpoch alone must NOT reset; explicit hint required!
+    s3.counter_reset_hint = true;
     let s4 = mock.create_sample(
         "codex",
         "Codex",
@@ -775,7 +777,11 @@ fn test_m_sqlite_primary_key_idempotency() {
         gap_state: GapState::Normal,
         source_priority: 1,
         source_cumulative_context_input: None,
+        source_cumulative_fresh_input: None,
         source_cumulative_output: None,
+        source_cumulative_cache_read: None,
+        source_cumulative_cache_write: None,
+        source_cumulative_reasoning: None,
     };
 
     let l = CanonicalRequestLedger {
@@ -1438,7 +1444,11 @@ fn test_v_effective_in_tps() {
             gap_state: GapState::Normal,
             source_priority: 1,
             source_cumulative_context_input: None,
+            source_cumulative_fresh_input: None,
             source_cumulative_output: None,
+            source_cumulative_cache_read: None,
+            source_cumulative_cache_write: None,
+            source_cumulative_reasoning: None,
         });
 
     assert_eq!(metric, InputThroughputMetric::EffectiveMeasured(40000.0));
@@ -1501,7 +1511,11 @@ fn test_w_in_unavailable() {
             gap_state: GapState::Normal,
             source_priority: 1,
             source_cumulative_context_input: None,
+            source_cumulative_fresh_input: None,
             source_cumulative_output: None,
+            source_cumulative_cache_read: None,
+            source_cumulative_cache_write: None,
+            source_cumulative_reasoning: None,
         });
 
     assert_eq!(metric, InputThroughputMetric::Unavailable);
@@ -2485,6 +2499,536 @@ fn test_am_source_handoff_uncertainty() {
 
     assert_eq!(ledger.canonical_output_total, 100, "Total must remain 100!");
     println!("UNCERTAIN HANDOFF FOLLOW-UP = PASS");
+}
+
+#[test]
+fn test_ao_safe_handoff_follow_up() {
+    let mut pipeline = create_test_pipeline("run_ao");
+    let semantics = generic_semantics();
+
+    // Source A cumulative output = 100
+    let mock_a = MockAdapter::new("run_ao");
+    let s_a = mock_a.create_sample_with_native(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_ao",
+        Some("req_ao"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Snapshot,
+        true,
+        0,
+        100,
+        0,
+        0,
+        0,
+        5,
+        SourceNativeIdentity::default(),
+        "source_a".to_string(),
+    );
+    pipeline
+        .process_sample(&s_a, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    // Source B (higher rank) cumulative output = 80 (cannot align)
+    let mock_b1 = MockAdapter::new("run_ao");
+    let s_b1 = mock_b1.create_sample_with_native(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_ao",
+        Some("req_ao"),
+        None,
+        2_000_000_000,
+        2000,
+        EventKind::Snapshot,
+        true,
+        0,
+        80,
+        0,
+        0,
+        0,
+        10,
+        SourceNativeIdentity::default(),
+        "source_b".to_string(),
+    );
+    let o_b1 = pipeline
+        .process_sample(&s_b1, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+    assert!(
+        extract_delta(o_b1).is_none(),
+        "B at 80 must NOT contribute any delta!"
+    );
+
+    // Active source must STILL be A, Canonical = 100
+    let ledger1 = pipeline
+        .request_ledger
+        .get_ledger(&RequestCorrelationKey {
+            agent_id: "codex".to_string(),
+            session_id: "sess_ao".to_string(),
+            request_id: "req_ao".to_string(),
+        })
+        .unwrap();
+    assert_eq!(ledger1.canonical_output_total, 100);
+    assert_eq!(
+        ledger1.winning_source, "source_a",
+        "Active source must still be A when alignment is impossible!"
+    );
+
+    // Source B follow-up cumulative output = 110 (now safely aligned)
+    let mock_b2 = MockAdapter::new("run_ao");
+    let s_b2 = mock_b2.create_sample_with_native(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_ao",
+        Some("req_ao"),
+        None,
+        3_000_000_000,
+        3000,
+        EventKind::Snapshot,
+        true,
+        0,
+        110,
+        0,
+        0,
+        0,
+        10,
+        SourceNativeIdentity::default(),
+        "source_b".to_string(),
+    );
+    let o_b2 = pipeline
+        .process_sample(&s_b2, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+    let delta_b2 = extract_delta(o_b2).expect("B at 110 must now contribute delta!");
+    assert_eq!(
+        delta_b2.delta_output_tokens, 10,
+        "Follow-up handoff must only add 10 (110 - 100)!"
+    );
+
+    // Active source must NOW be B, Canonical = 110 (NOT 130/210)
+    let ledger2 = pipeline
+        .request_ledger
+        .get_ledger(&RequestCorrelationKey {
+            agent_id: "codex".to_string(),
+            session_id: "sess_ao".to_string(),
+            request_id: "req_ao".to_string(),
+        })
+        .unwrap();
+    assert_eq!(
+        ledger2.canonical_output_total, 110,
+        "Canonical must equal 110, NOT 130 or 210!"
+    );
+    assert_eq!(
+        ledger2.winning_source, "source_b",
+        "Active source must switch to B ONLY after safe alignment!"
+    );
+    println!("SAFE HANDOFF FOLLOW-UP = PASS");
+}
+
+#[test]
+fn test_au_all_field_handoff_alignment() {
+    let mut pipeline = create_test_pipeline("run_au");
+    let semantics = generic_semantics();
+
+    // Source A: Context=1000 Fresh=400 Output=100 CacheRead=600 CacheWrite=50 Reasoning=20
+    let mock_a = MockAdapter::new("run_au");
+    let s_a = mock_a.create_sample_with_native(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_au",
+        Some("req_au"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Snapshot,
+        true,
+        1000,
+        100,
+        600,
+        50,
+        20,
+        5,
+        SourceNativeIdentity::default(),
+        "source_a".to_string(),
+    );
+    pipeline
+        .process_sample(&s_a, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    // Source B (higher rank): Context=1100 Fresh=450 Output=120 CacheRead=650 CacheWrite=70 Reasoning=30
+    let mock_b = MockAdapter::new("run_au");
+    let s_b = mock_b.create_sample_with_native(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_au",
+        Some("req_au"),
+        None,
+        2_000_000_000,
+        2000,
+        EventKind::Snapshot,
+        true,
+        1100,
+        120,
+        650,
+        70,
+        30,
+        10,
+        SourceNativeIdentity::default(),
+        "source_b".to_string(),
+    );
+    pipeline
+        .process_sample(&s_b, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    // Final Ledger must exactly equal B's cumulative position (NOT double-counted)
+    let ledger = pipeline
+        .request_ledger
+        .get_ledger(&RequestCorrelationKey {
+            agent_id: "codex".to_string(),
+            session_id: "sess_au".to_string(),
+            request_id: "req_au".to_string(),
+        })
+        .unwrap();
+
+    assert_eq!(ledger.canonical_context_input_total, 1100);
+    assert_eq!(ledger.canonical_fresh_input_total, 450);
+    assert_eq!(ledger.canonical_output_total, 120);
+    assert_eq!(ledger.canonical_cache_read, 650);
+    assert_eq!(ledger.canonical_cache_write, 70);
+    assert_eq!(ledger.canonical_reasoning, 30);
+    println!("ALL FIELD HANDOFF ALIGNMENT = PASS");
+}
+
+#[test]
+fn test_av_missing_field_blocks_handoff() {
+    let mut pipeline = create_test_pipeline("run_av");
+    let semantics = generic_semantics();
+
+    // Source A contributes: Output=100 CacheRead=600
+    let mock_a = MockAdapter::new("run_av");
+    let s_a = mock_a.create_sample_with_native(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_av",
+        Some("req_av"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Snapshot,
+        true,
+        0,
+        100,
+        600,
+        0,
+        0,
+        5,
+        SourceNativeIdentity::default(),
+        "source_a".to_string(),
+    );
+    pipeline
+        .process_sample(&s_a, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    // Source B (higher rank): Output cumulative=120 but CacheRead cumulative=None (unavailable)
+    let mock_b = MockAdapter::new("run_av");
+    let mut s_b = mock_b.create_sample_with_native(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_av",
+        Some("req_av"),
+        None,
+        2_000_000_000,
+        2000,
+        EventKind::Snapshot,
+        true,
+        0,
+        120,
+        0,
+        0,
+        0,
+        10,
+        SourceNativeIdentity::default(),
+        "source_b".to_string(),
+    );
+    // Simulate source cannot provide cache_read field at all
+    s_b.raw_usage.raw_cache_read_tokens = None;
+
+    let o_b = pipeline
+        .process_sample(&s_b, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+    assert!(
+        extract_delta(o_b).is_none(),
+        "B missing cache_read cumulative must NOT handoff!"
+    );
+
+    // Canonical stays: Output=100 CacheRead=600, active source still A
+    let ledger = pipeline
+        .request_ledger
+        .get_ledger(&RequestCorrelationKey {
+            agent_id: "codex".to_string(),
+            session_id: "sess_av".to_string(),
+            request_id: "req_av".to_string(),
+        })
+        .unwrap();
+    assert_eq!(ledger.canonical_output_total, 100);
+    assert_eq!(ledger.canonical_cache_read, 600);
+    assert_eq!(ledger.winning_source, "source_a");
+    println!("MISSING FIELD HANDOFF SAFETY = PASS");
+}
+
+#[test]
+fn test_aw_independent_counter_decrease_safety() {
+    let mut pipeline = create_test_pipeline("run_aw");
+    let mock = MockAdapter::new("run_aw");
+    let semantics = generic_semantics();
+
+    // Snapshot 1: Output=100 CacheRead=1000
+    let s1 = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_aw",
+        Some("req_aw"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Snapshot,
+        true,
+        0,
+        100,
+        1000,
+        0,
+        0,
+        1,
+    );
+    // Snapshot 2: Output=120 CacheRead=1500
+    let s2 = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_aw",
+        Some("req_aw"),
+        None,
+        2_000_000_000,
+        2000,
+        EventKind::Snapshot,
+        true,
+        0,
+        120,
+        1500,
+        0,
+        0,
+        1,
+    );
+    // Snapshot 3: Output=140 CacheRead=100 (cache decrease, NO reset hint!)
+    let s3 = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_aw",
+        Some("req_aw"),
+        None,
+        3_000_000_000,
+        3000,
+        EventKind::Snapshot,
+        true,
+        0,
+        140,
+        100,
+        0,
+        0,
+        1,
+    );
+    // Snapshot 4: Output=150 CacheRead=1600
+    let s4 = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_aw",
+        Some("req_aw"),
+        None,
+        4_000_000_000,
+        4000,
+        EventKind::Snapshot,
+        true,
+        0,
+        150,
+        1600,
+        0,
+        0,
+        1,
+    );
+
+    pipeline
+        .process_sample(&s1, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+    pipeline
+        .process_sample(&s2, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+    pipeline
+        .process_sample(&s3, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+    pipeline
+        .process_sample(&s4, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    let ledger = pipeline
+        .request_ledger
+        .get_ledger(&RequestCorrelationKey {
+            agent_id: "codex".to_string(),
+            session_id: "sess_aw".to_string(),
+            request_id: "req_aw".to_string(),
+        })
+        .unwrap();
+
+    assert_eq!(
+        ledger.canonical_output_total, 150,
+        "Output total must be 150!"
+    );
+    assert_eq!(
+        ledger.canonical_cache_read, 1600,
+        "CacheRead total must be 1600 (S3 cache decrease must NOT add 100)!"
+    );
+    println!("INDEPENDENT COUNTER DECREASE SAFETY = PASS");
+}
+
+#[test]
+fn test_ax_continuous_epoch_requires_reset_hint() {
+    let mut tracker = BaselineTracker::new();
+    let key = RequestCorrelationKey {
+        agent_id: "codex".to_string(),
+        session_id: "sess_ax".to_string(),
+        request_id: "req_ax".to_string(),
+    };
+
+    // First observation 200
+    let c1 = tracker.process_counters(
+        "adapter_ax",
+        &key,
+        0,
+        0,
+        200,
+        0,
+        0,
+        0,
+        BaselineMode::ContinuousEpoch,
+        false,
+    );
+    assert_eq!(c1.delta_output, 200);
+
+    // 200 -> 50 with ContinuousEpoch but NO reset hint: must NOT auto reset to +50!
+    let c2 = tracker.process_counters(
+        "adapter_ax",
+        &key,
+        0,
+        0,
+        50,
+        0,
+        0,
+        0,
+        BaselineMode::ContinuousEpoch,
+        false,
+    );
+    assert_eq!(
+        c2.delta_output, 0,
+        "ContinuousEpoch without explicit reset hint must NOT auto-reset!"
+    );
+    assert!(c2.is_late_old_sample);
+
+    // Explicit counter_reset_hint = true: new epoch, delta = 50 allowed
+    let c3 = tracker.process_counters(
+        "adapter_ax",
+        &key,
+        0,
+        0,
+        50,
+        0,
+        0,
+        0,
+        BaselineMode::ContinuousEpoch,
+        true,
+    );
+    assert_eq!(
+        c3.delta_output, 50,
+        "Only explicit reset hint may establish new epoch with delta = 50!"
+    );
+    println!("EXPLICIT RESET HINT ONLY = PASS");
+}
+
+#[test]
+fn test_ay_canonical_total_stability() {
+    let mut pipeline = create_test_pipeline("run_ay");
+    let mock = MockAdapter::new("run_ay");
+    let semantics = UsageSemantics {
+        reasoning_is_output_subset: true,
+        accounting_strategy: UsageAccountingStrategy::OpenAiStyle,
+        provider_name: "openai".to_string(),
+    };
+
+    // Native Delta path: input=1000, cache_read=600, output=100 -> Context=1000 Fresh=400
+    let s_native = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_ay",
+        Some("req_ay1"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Delta,
+        false,
+        1000,
+        100,
+        600,
+        0,
+        0,
+        1,
+    );
+    let o_native = pipeline
+        .process_sample(&s_native, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+    let d_native = extract_delta(o_native).expect("Native delta must be produced");
+    assert_eq!(
+        d_native.delta_total, 1100,
+        "Native Delta Canonical Total must be Context(1000) + Output(100) = 1100!"
+    );
+
+    // Cumulative Snapshot path: same values
+    let s_snap = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_ay",
+        Some("req_ay2"),
+        None,
+        2_000_000_000,
+        2000,
+        EventKind::Snapshot,
+        true,
+        1000,
+        100,
+        600,
+        0,
+        0,
+        1,
+    );
+    let o_snap = pipeline
+        .process_sample(&s_snap, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+    let d_snap = extract_delta(o_snap).expect("Snapshot delta must be produced");
+    assert_eq!(
+        d_snap.delta_total, 1100,
+        "Cumulative Snapshot Canonical Total must ALSO be Context(1000) + Output(100) = 1100, NOT 500!"
+    );
+
+    println!("CANONICAL TOTAL STABILITY = PASS");
 }
 
 #[test]

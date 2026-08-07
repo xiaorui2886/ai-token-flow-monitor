@@ -269,8 +269,13 @@ pub struct CanonicalTokenDelta {
     pub measurement_kind: MeasurementKind,
     pub gap_state: GapState,
     pub source_priority: u8,
+    // Multi-Field Consistency Freeze: 6-field source cumulative position (None = source cannot provide this field)
     pub source_cumulative_context_input: Option<u64>,
+    pub source_cumulative_fresh_input: Option<u64>,
     pub source_cumulative_output: Option<u64>,
+    pub source_cumulative_cache_read: Option<u64>,
+    pub source_cumulative_cache_write: Option<u64>,
+    pub source_cumulative_reasoning: Option<u64>,
 }
 
 /// Canonical correction event for ledger adjustments (i64)
