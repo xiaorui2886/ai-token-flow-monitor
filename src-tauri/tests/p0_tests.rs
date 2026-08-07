@@ -1935,7 +1935,6 @@ fn test_ae_interval_exact_instant_exclusion() {
     let mock = MockAdapter::new("run_ae");
     let semantics = generic_semantics();
 
-    // Sample with TemporalAccuracy::IntervalExact
     let mut sample = mock.create_sample(
         "codex",
         "Codex",
@@ -1955,6 +1954,7 @@ fn test_ae_interval_exact_instant_exclusion() {
         1,
     );
     sample.temporal_accuracy = TemporalAccuracy::IntervalExact;
+    sample.timing.measurement_interval_ms = Some(2000);
 
     pipeline
         .process_sample(&sample, &semantics, BaselineMode::KnownZeroOrigin)
@@ -1967,6 +1967,14 @@ fn test_ae_interval_exact_instant_exclusion() {
         metrics.current_out_tps, 0.0,
         "IntervalExact must NOT enter 1s Instant Live OUT TPS!"
     );
+    assert_eq!(
+        metrics.interval_avg_metric,
+        Some(IntervalAverageMetric {
+            interval_tokens: 120,
+            interval_duration_sec: Some(2.0),
+            interval_tps: Some(60.0),
+        })
+    );
     println!("INTERVAL EXACT INSTANT EXCLUSION = PASS");
 }
 
@@ -1975,7 +1983,6 @@ fn test_af_cross_source_handoff_reconciliation() {
     let mut pipeline = create_test_pipeline("run_af");
     let semantics = generic_semantics();
 
-    // Source 1 (Low priority/IntervalExact): snapshot 100
     let mock_jsonl = MockAdapter::new("run_af");
     let mut s_jsonl = mock_jsonl.create_sample_with_native(
         "codex",
@@ -2003,7 +2010,6 @@ fn test_af_cross_source_handoff_reconciliation() {
         .process_sample(&s_jsonl, &semantics, BaselineMode::KnownZeroOrigin)
         .unwrap();
 
-    // Source 2 (High priority/StreamExact): snapshot 120
     let mock_app = MockAdapter::new("run_af");
     let s_app = mock_app.create_sample_with_native(
         "codex",
@@ -2096,6 +2102,7 @@ fn test_ag_end_to_end_in_tps() {
 
     assert_eq!(global_metrics.in_coverage_measured, 1);
     assert_eq!(global_metrics.in_coverage_total, 1);
+    assert_eq!(global_metrics.global_in_tps, Some(40000.0));
     println!("END TO END IN TPS = PASS");
 }
 
@@ -2302,7 +2309,6 @@ fn test_ak_source_ranking_accuracy_temporal_priority() {
     let temp_stream = TemporalAccuracy::StreamExact;
     let temp_turn = TemporalAccuracy::TurnExact;
 
-    // Exact > Estimated regardless of priority
     assert!(is_better_source(
         t_exact,
         temp_turn,
@@ -2311,7 +2317,6 @@ fn test_ak_source_ranking_accuracy_temporal_priority() {
         temp_stream,
         10
     ));
-    // StreamExact > TurnExact if TokenAccuracy equal
     assert!(is_better_source(
         t_exact,
         temp_stream,
@@ -2320,7 +2325,6 @@ fn test_ak_source_ranking_accuracy_temporal_priority() {
         temp_turn,
         10
     ));
-    // Priority tie-breaker when Accuracy and TemporalAccuracy equal
     assert!(is_better_source(
         t_exact,
         temp_stream,
@@ -2330,6 +2334,290 @@ fn test_ak_source_ranking_accuracy_temporal_priority() {
         5
     ));
     println!("SOURCE RANKING ACCURACY > TEMPORAL > PRIORITY = PASS");
+}
+
+#[test]
+fn test_al_finalized_request_excluded_from_instant_tps() {
+    let mut pipeline = create_test_pipeline("run_al");
+    let mock = MockAdapter::new("run_al");
+    let semantics = generic_semantics();
+
+    // Finalize request at 196
+    let s_final = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_al",
+        Some("req_al"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Final,
+        true,
+        0,
+        196,
+        0,
+        0,
+        0,
+        1,
+    );
+    pipeline
+        .process_sample(&s_final, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    // Late snapshot 180 on finalized request
+    let s_late = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_al",
+        Some("req_al"),
+        None,
+        2_000_000_000,
+        2000,
+        EventKind::Snapshot,
+        true,
+        0,
+        180,
+        0,
+        0,
+        0,
+        1,
+    );
+    pipeline
+        .process_sample(&s_late, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    let metrics = pipeline
+        .tps_engine
+        .calculate_agent_tps("codex", 2_000_000_000, "run_al");
+    assert_eq!(
+        metrics.current_out_tps, 0.0,
+        "Late snapshot on finalized request must NOT enter Instant OUT TPS!"
+    );
+    println!("FINALIZED REQUEST EXCLUDED FROM INSTANT TPS = PASS");
+}
+
+#[test]
+fn test_am_source_handoff_uncertainty() {
+    let mut pipeline = create_test_pipeline("run_am");
+    let semantics = generic_semantics();
+
+    // Source A: 100 tokens (Priority 5)
+    let mock_a = MockAdapter::new("run_am");
+    let s_a = mock_a.create_sample_with_native(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_am",
+        Some("req_am"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Snapshot,
+        true,
+        0,
+        100,
+        0,
+        0,
+        0,
+        5,
+        SourceNativeIdentity::default(),
+        "source_a".to_string(),
+    );
+    pipeline
+        .process_sample(&s_a, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    // Source B (High Priority 10) arrives with 80 tokens (< previous 100 contribution)
+    let mock_b = MockAdapter::new("run_am");
+    let s_b = mock_b.create_sample_with_native(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_am",
+        Some("req_am"),
+        None,
+        2_000_000_000,
+        2000,
+        EventKind::Snapshot,
+        true,
+        0,
+        80,
+        0,
+        0,
+        0,
+        10,
+        SourceNativeIdentity::default(),
+        "source_b".to_string(),
+    );
+
+    let o_b = pipeline
+        .process_sample(&s_b, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+    let delta_b = extract_delta(o_b);
+
+    let b_out_tokens = delta_b.map(|d| d.delta_output_tokens).unwrap_or(0);
+    assert_eq!(
+        b_out_tokens, 0,
+        "Handoff to source B at 80 (< 100) must produce 0 extra delta!"
+    );
+
+    let ledger = pipeline
+        .request_ledger
+        .get_ledger(&RequestCorrelationKey {
+            agent_id: "codex".to_string(),
+            session_id: "sess_am".to_string(),
+            request_id: "req_am".to_string(),
+        })
+        .unwrap();
+
+    assert_eq!(ledger.canonical_output_total, 100, "Total must remain 100!");
+    println!("SOURCE HANDOFF UNCERTAINTY = PASS");
+}
+
+#[test]
+fn test_fix1_interval_without_duration() {
+    let mock = MockAdapter::new("run_fix1");
+    let mut sample = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_fix1",
+        Some("req_fix1"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Snapshot,
+        true,
+        0,
+        100,
+        0,
+        0,
+        0,
+        1,
+    );
+    sample.temporal_accuracy = TemporalAccuracy::IntervalExact;
+    sample.timing.measurement_interval_ms = None; // No duration
+
+    let mut pipeline = create_test_pipeline("run_fix1");
+    let semantics = generic_semantics();
+    pipeline
+        .process_sample(&sample, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    let metrics = pipeline
+        .tps_engine
+        .calculate_agent_tps("codex", 1_000_000_000, "run_fix1");
+    assert_eq!(
+        metrics.interval_avg_metric,
+        Some(IntervalAverageMetric {
+            interval_tokens: 100,
+            interval_duration_sec: None,
+            interval_tps: None,
+        })
+    );
+    println!("FIX1 INTERVAL WITHOUT DURATION = PASS");
+}
+
+#[test]
+fn test_fix2_persistence_accuracy_restore() {
+    let temp_db_path = std::env::temp_dir().join(format!("test_fix2_{}.db", uuid::Uuid::new_v4()));
+    {
+        let storage = Arc::new(Mutex::new(StorageManager::new_file(&temp_db_path).unwrap()));
+        let mut p1 = EnginePipeline::new("run_fix2_1", storage).unwrap();
+        let mock = MockAdapter::new("run_fix2_1");
+        let semantics = generic_semantics();
+
+        let mut sample = mock.create_sample(
+            "codex",
+            "Codex",
+            "gpt-4o",
+            "sess_fix2",
+            Some("req_fix2"),
+            None,
+            1_000_000_000,
+            1000,
+            EventKind::Snapshot,
+            true,
+            0,
+            100,
+            0,
+            0,
+            0,
+            1,
+        );
+        sample.token_accuracy = TokenAccuracy::Exact;
+        sample.temporal_accuracy = TemporalAccuracy::TurnExact;
+
+        p1.process_sample(&sample, &semantics, BaselineMode::KnownZeroOrigin)
+            .unwrap();
+    }
+
+    {
+        let storage2 = Arc::new(Mutex::new(StorageManager::new_file(&temp_db_path).unwrap()));
+        let p2 = EnginePipeline::new("run_fix2_2", storage2).unwrap();
+
+        let ledger = p2
+            .request_ledger
+            .get_ledger(&RequestCorrelationKey {
+                agent_id: "codex".to_string(),
+                session_id: "sess_fix2".to_string(),
+                request_id: "req_fix2".to_string(),
+            })
+            .unwrap();
+
+        assert_eq!(ledger.active_live_token_accuracy, TokenAccuracy::Exact);
+        assert_eq!(
+            ledger.active_live_temporal_accuracy,
+            TemporalAccuracy::TurnExact
+        );
+    }
+    let _ = std::fs::remove_file(temp_db_path);
+    println!("FIX2 PERSISTENCE ACCURACY RESTORE = PASS");
+}
+
+#[test]
+fn test_fix3_correction_does_not_reset_generation() {
+    let mut tracker = BaselineTracker::new();
+    let key = RequestCorrelationKey {
+        agent_id: "codex".to_string(),
+        session_id: "sess_fix3".to_string(),
+        request_id: "req_fix3".to_string(),
+    };
+
+    let c1 = tracker.process_counters(
+        "adapter_fix3",
+        &key,
+        0,
+        0,
+        100,
+        0,
+        0,
+        0,
+        BaselineMode::KnownZeroOrigin,
+        false,
+    );
+    assert_eq!(c1.delta_output, 100);
+
+    // EventKind::Correction should NOT reset generation when counter_reset_hint = false!
+    let c2 = tracker.process_counters(
+        "adapter_fix3",
+        &key,
+        0,
+        0,
+        80,
+        0,
+        0,
+        0,
+        BaselineMode::KnownZeroOrigin,
+        false, // NOT explicit reset
+    );
+    assert_eq!(
+        c2.delta_output, 0,
+        "Correction event without reset hint must NOT trigger counter reset!"
+    );
+    println!("FIX3 CORRECTION DOES NOT RESET GENERATION = PASS");
 }
 
 fn is_better_source(

@@ -54,10 +54,8 @@ impl SnapshotAccumulator {
             };
         }
 
-        // Cumulative snapshot mode across ALL counters (P0-1)
-        // P1-3: Use explicit counter_reset_hint or EventKind::Correction
-        let is_explicit_reset =
-            sample.counter_reset_hint || sample.event_kind == EventKind::Correction;
+        // Fix 3: ONLY explicit counter_reset_hint can trigger counter reset (NOT EventKind::Correction!)
+        let is_explicit_reset = sample.counter_reset_hint;
 
         let c_deltas = self.tracker.process_counters(
             &sample.source_adapter_id,

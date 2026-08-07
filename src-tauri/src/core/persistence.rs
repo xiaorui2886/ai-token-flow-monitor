@@ -300,7 +300,8 @@ impl StorageManager {
                     live_contributed_cache_read, live_contributed_cache_write, live_contributed_reasoning,
                     authoritative_final_context_input, authoritative_final_fresh_input, authoritative_final_output,
                     authoritative_final_cache_read, authoritative_final_cache_write, authoritative_final_reasoning,
-                    winning_source, active_live_source_priority, is_finalized, normalization_version, last_reconciled_at_ms
+                    winning_source, active_live_source_priority, active_live_token_accuracy, active_live_temporal_accuracy,
+                    is_finalized, normalization_version, last_reconciled_at_ms
              FROM canonical_request_ledgers",
         )?;
 
@@ -308,7 +309,9 @@ impl StorageManager {
             let agent_id: String = row.get(0)?;
             let session_id: String = row.get(1)?;
             let request_id: String = row.get(2)?;
-            let is_finalized_int: i32 = row.get(25)?;
+            let token_acc_str: String = row.get(25)?;
+            let temp_acc_str: String = row.get(26)?;
+            let is_finalized_int: i32 = row.get(27)?;
 
             Ok(CanonicalRequestLedger {
                 correlation_key: RequestCorrelationKey {
@@ -339,11 +342,11 @@ impl StorageManager {
                 authoritative_final_reasoning: row.get(22)?,
                 winning_source: row.get(23)?,
                 active_live_source_priority: row.get(24)?,
-                active_live_token_accuracy: TokenAccuracy::Exact,
-                active_live_temporal_accuracy: TemporalAccuracy::StreamExact,
+                active_live_token_accuracy: parse_token_acc(&token_acc_str),
+                active_live_temporal_accuracy: parse_temporal_acc(&temp_acc_str),
                 is_finalized: is_finalized_int != 0,
-                normalization_version: row.get(26)?,
-                last_reconciled_at_ms: row.get(27)?,
+                normalization_version: row.get(28)?,
+                last_reconciled_at_ms: row.get(29)?,
             })
         })?;
 
@@ -394,5 +397,24 @@ impl StorageManager {
         )?;
         let total: u64 = stmt.query_row(params![agent_id], |row| row.get(0))?;
         Ok(total)
+    }
+}
+
+fn parse_token_acc(s: &str) -> TokenAccuracy {
+    match s {
+        "Exact" => TokenAccuracy::Exact,
+        "Measured" => TokenAccuracy::Measured,
+        "Estimated" => TokenAccuracy::Estimated,
+        _ => TokenAccuracy::Unavailable,
+    }
+}
+
+fn parse_temporal_acc(s: &str) -> TemporalAccuracy {
+    match s {
+        "StreamExact" => TemporalAccuracy::StreamExact,
+        "IntervalExact" => TemporalAccuracy::IntervalExact,
+        "TurnExact" => TemporalAccuracy::TurnExact,
+        "Estimated" => TemporalAccuracy::Estimated,
+        _ => TemporalAccuracy::Unavailable,
     }
 }

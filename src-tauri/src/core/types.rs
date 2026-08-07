@@ -40,6 +40,13 @@ pub enum GapState {
     Resume,
 }
 
+/// Confidence rating for cross-source handoff alignment (Fix 5)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HandoffConfidence {
+    Exact,
+    Uncertain,
+}
+
 /// Accuracy level of token counts
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 pub enum TokenAccuracy {
@@ -133,7 +140,7 @@ pub struct RawUsage {
     pub raw_total_tokens: Option<u64>,
 }
 
-/// Detailed timing information
+/// Detailed timing information (Fix 1: measurement_interval_ms)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TimingInfo {
     pub request_start_ms: Option<i64>,
@@ -141,6 +148,7 @@ pub struct TimingInfo {
     pub last_token_ms: Option<i64>,
     pub prefill_start_ms: Option<i64>,
     pub prefill_end_ms: Option<i64>,
+    pub measurement_interval_ms: Option<u64>,
 }
 
 /// Raw sample from any adapter
@@ -166,7 +174,7 @@ pub struct RawSourceSample {
     pub event_kind: EventKind,
     pub is_cumulative: bool,
     pub is_final: bool,
-    pub counter_reset_hint: bool, // P1-3: Explicit reset hint
+    pub counter_reset_hint: bool,
     pub raw_usage: RawUsage,
     pub timing: TimingInfo,
     pub source_priority: u8,
@@ -225,15 +233,15 @@ pub enum InputThroughputMetric {
     Unavailable,
 }
 
-/// Interval average OUT TPS metric for non-stream interval samples (P0-1)
+/// Interval average OUT TPS metric (Fix 1: Option<f64>)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct IntervalAverageMetric {
     pub interval_tokens: u64,
-    pub interval_duration_sec: f64,
-    pub interval_tps: f64,
+    pub interval_duration_sec: Option<f64>,
+    pub interval_tps: Option<f64>,
 }
 
-/// Canonical positive token delta (u64) with separate context & fresh input fields (P0-4)
+/// Canonical positive token delta (u64)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalTokenDelta {
     pub delta_id: String,
@@ -283,7 +291,7 @@ pub struct CanonicalCorrection {
     pub new_total: u64,
 }
 
-/// Canonical request ledger tracking authoritative usage with separate context & fresh input (P0-4)
+/// Canonical request ledger tracking authoritative usage
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalRequestLedger {
     pub correlation_key: RequestCorrelationKey,
@@ -328,7 +336,7 @@ pub struct SourceCheckpoint {
     pub updated_at_ms: i64,
 }
 
-/// Today's aggregated token usage metrics (P1-1)
+/// Today's aggregated token usage metrics
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TodayTokenAggregates {
     pub today_date_str: String,

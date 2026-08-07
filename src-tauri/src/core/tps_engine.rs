@@ -62,17 +62,27 @@ impl TPSEngine {
             measurement_kind: delta.measurement_kind,
         };
 
-        // P0-1: Compute IntervalAverageMetric for non-stream interval samples (e.g., IntervalExact)
+        // Fix 1: Compute IntervalAverageMetric dynamically from measurement_interval_ms (no hardcoded 2s!)
         if delta.temporal_accuracy == TemporalAccuracy::IntervalExact
             && delta.delta_output_tokens > 0
         {
-            let interval_tps = delta.delta_output_tokens as f64 / 2.0; // 2s sample window default
+            let (dur_sec, tps) = if let Some(ms) = delta.timing.measurement_interval_ms {
+                if ms > 0 {
+                    let sec = ms as f64 / 1000.0;
+                    (Some(sec), Some(delta.delta_output_tokens as f64 / sec))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+
             self.agent_interval_metrics.insert(
                 delta.agent_id.clone(),
                 IntervalAverageMetric {
                     interval_tokens: delta.delta_output_tokens,
-                    interval_duration_sec: 2.0,
-                    interval_tps,
+                    interval_duration_sec: dur_sec,
+                    interval_tps: tps,
                 },
             );
         }

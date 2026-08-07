@@ -135,6 +135,7 @@ impl MockAdapter {
                 last_token_ms: Some(wall_ms),
                 prefill_start_ms: None,
                 prefill_end_ms: None,
+                measurement_interval_ms: None,
             },
             source_priority,
             token_accuracy: token_acc,

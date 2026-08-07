@@ -74,7 +74,7 @@ impl CrossSourceReconciler {
             return Some(delta.clone());
         }
 
-        // 3. Active Source Ranking: TokenAccuracy -> TemporalAccuracy -> source_priority (P0-2)
+        // 3. Active Source Ranking: TokenAccuracy -> TemporalAccuracy -> source_priority (P0-2 & Fix 5)
         let key = &delta.correlation_key;
         if let Some(active) = self.request_active_sources.get_mut(key) {
             if delta.source_adapter_id == active.source_adapter_id {
@@ -89,7 +89,7 @@ impl CrossSourceReconciler {
                 active.temporal_accuracy,
                 active.priority,
             ) {
-                // Source Handoff Reconciliation: Handoff baseline alignment (P0-2)
+                // Source Handoff Reconciliation: Handoff baseline alignment (P0-2 & Fix 5)
                 let mut adjusted_delta = delta.clone();
 
                 let prev_c_in = active.contributed_context_input;
@@ -97,10 +97,16 @@ impl CrossSourceReconciler {
 
                 if delta.delta_context_input_tokens >= prev_c_in {
                     adjusted_delta.delta_context_input_tokens -= prev_c_in;
+                } else {
+                    adjusted_delta.delta_context_input_tokens = 0;
                 }
+
                 if delta.delta_output_tokens >= prev_out {
                     adjusted_delta.delta_output_tokens -= prev_out;
+                } else {
+                    adjusted_delta.delta_output_tokens = 0;
                 }
+
                 adjusted_delta.delta_total =
                     adjusted_delta.delta_fresh_input_tokens + adjusted_delta.delta_output_tokens;
 
