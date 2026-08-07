@@ -1,0 +1,35 @@
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Rust
+target/
+src-tauri/target/
+
+# Node
+node_modules/
+dist/
+
+# Runtime databases & zip packs
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.zip
+
+# Logs
+*.log
+
+# Runtime/private data
+runtime-data/
+sessions/
+transcripts/
+private-evidence/
+
+# OS
+.DS_Store
+Thumbs.db
