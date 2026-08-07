@@ -269,6 +269,8 @@ pub struct CanonicalTokenDelta {
     pub measurement_kind: MeasurementKind,
     pub gap_state: GapState,
     pub source_priority: u8,
+    pub source_cumulative_context_input: Option<u64>,
+    pub source_cumulative_output: Option<u64>,
 }
 
 /// Canonical correction event for ledger adjustments (i64)
@@ -371,8 +373,9 @@ pub struct AgentStatus {
     pub current_in_tps: Option<f64>,
     pub current_out_tps: f64,
     pub interval_avg_metric: Option<IntervalAverageMetric>,
-    pub today_tokens: u64,
-    pub session_tokens: u64,
+    // Freeze Patch Fix 4: No committed aggregate provider yet -> always None (never fake 0!)
+    pub today_tokens: Option<u64>,
+    pub session_tokens: Option<u64>,
     pub token_accuracy: TokenAccuracy,
     pub temporal_accuracy: TemporalAccuracy,
     pub last_updated_at_ms: i64,

@@ -774,6 +774,8 @@ fn test_m_sqlite_primary_key_idempotency() {
         measurement_kind: MeasurementKind::NativeCounter,
         gap_state: GapState::Normal,
         source_priority: 1,
+        source_cumulative_context_input: None,
+        source_cumulative_output: None,
     };
 
     let l = CanonicalRequestLedger {
@@ -1435,6 +1437,8 @@ fn test_v_effective_in_tps() {
             measurement_kind: MeasurementKind::NativeCounter,
             gap_state: GapState::Normal,
             source_priority: 1,
+            source_cumulative_context_input: None,
+            source_cumulative_output: None,
         });
 
     assert_eq!(metric, InputThroughputMetric::EffectiveMeasured(40000.0));
@@ -1496,6 +1500,8 @@ fn test_w_in_unavailable() {
             measurement_kind: MeasurementKind::NativeCounter,
             gap_state: GapState::Normal,
             source_priority: 1,
+            source_cumulative_context_input: None,
+            source_cumulative_output: None,
         });
 
     assert_eq!(metric, InputThroughputMetric::Unavailable);
@@ -2617,7 +2623,6 @@ fn test_ar_5s_live_eligibility() {
     let mock = MockAdapter::new("run_ar");
     let semantics = generic_semantics();
 
-    // StreamExact = 50
     let s_stream = mock.create_sample(
         "codex",
         "Codex",
@@ -2637,7 +2642,6 @@ fn test_ar_5s_live_eligibility() {
         1,
     );
 
-    // IntervalExact = 200
     let mut s_interval = mock.create_sample(
         "codex",
         "Codex",
@@ -2698,6 +2702,196 @@ fn test_as_schema_upgrade_policy() {
     }
     let _ = std::fs::remove_file(temp_db_path);
     println!("SCHEMA UPGRADE POLICY = PASS");
+}
+
+#[test]
+fn test_an_finalized_canonical_suppression() {
+    let temp_db_path = std::env::temp_dir().join(format!("test_an_{}.db", uuid::Uuid::new_v4()));
+    let storage = Arc::new(Mutex::new(StorageManager::new_file(&temp_db_path).unwrap()));
+    let mut pipeline = EnginePipeline::new("run_an", storage.clone()).unwrap();
+    let mock = MockAdapter::new("run_an");
+    let semantics = generic_semantics();
+
+    // 1. Finalize request at 196
+    let s_final = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_an",
+        Some("req_an"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Final,
+        true,
+        0,
+        196,
+        0,
+        0,
+        0,
+        1,
+    );
+    pipeline
+        .process_sample(&s_final, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    // Record canonical_token_deltas count
+    let deltas_before = storage.lock().load_stable_ingestion_ids().unwrap().len();
+
+    // 2. Late StreamExact Delta +50
+    let s_late = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_an",
+        Some("req_an"),
+        None,
+        2_000_000_000,
+        2000,
+        EventKind::Delta,
+        false,
+        0,
+        50,
+        0,
+        0,
+        0,
+        1,
+    );
+    let outcome = pipeline
+        .process_sample(&s_late, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    // 3. Verify Rejected outcome without canonical delta
+    match outcome {
+        ProcessOutcome::Rejected { reason } => {
+            assert_eq!(reason, "request_finalized_late_event");
+        }
+        _ => panic!("Finalized late event must return ProcessOutcome::Rejected!"),
+    }
+
+    // 4. Ledger stays 196
+    let ledger = pipeline
+        .request_ledger
+        .get_ledger(&RequestCorrelationKey {
+            agent_id: "codex".to_string(),
+            session_id: "sess_an".to_string(),
+            request_id: "req_an".to_string(),
+        })
+        .unwrap();
+    assert_eq!(ledger.canonical_output_total, 196);
+
+    // 5. canonical_token_deltas count unchanged
+    let deltas_after = storage.lock().load_stable_ingestion_ids().unwrap().len();
+    assert_eq!(
+        deltas_after, deltas_before,
+        "Finalized late event must NOT insert canonical_token_deltas!"
+    );
+
+    // 6. Instant TPS = 0
+    let metrics = pipeline
+        .tps_engine
+        .calculate_agent_tps("codex", 2_000_000_000, "run_an");
+    assert_eq!(metrics.current_out_tps, 0.0);
+
+    let _ = std::fs::remove_file(temp_db_path);
+    println!("FINALIZED CANONICAL SUPPRESSION = PASS");
+}
+
+#[test]
+fn test_as1_old_schema_stale_checkpoint_reset() {
+    let temp_db_path = std::env::temp_dir().join(format!("test_as1_{}.db", uuid::Uuid::new_v4()));
+    {
+        let conn = rusqlite::Connection::open(&temp_db_path).unwrap();
+        conn.execute("PRAGMA user_version = 1;", []).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE source_checkpoints (
+                source_id TEXT PRIMARY KEY,
+                last_file_offset INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE canonical_request_ledgers (
+                agent_id TEXT, session_id TEXT, request_id TEXT, PRIMARY KEY (agent_id, session_id, request_id)
+            );
+            INSERT INTO source_checkpoints (source_id, last_file_offset) VALUES ('old_src', 50000);
+            ",
+        )
+        .unwrap();
+    }
+
+    {
+        let storage = StorageManager::new_file(&temp_db_path).unwrap();
+        let cps = storage.load_checkpoints().unwrap();
+        assert_eq!(
+            cps.len(),
+            0,
+            "Old stale checkpoint (offset=50000) must NOT survive atomic schema reset!"
+        );
+    }
+    let _ = std::fs::remove_file(temp_db_path);
+    println!("SCHEMA ATOMIC RESET = PASS");
+}
+
+#[test]
+fn test_as2_future_schema_reject() {
+    let temp_db_path = std::env::temp_dir().join(format!("test_as2_{}.db", uuid::Uuid::new_v4()));
+    {
+        let conn = rusqlite::Connection::open(&temp_db_path).unwrap();
+        conn.execute("PRAGMA user_version = 3;", []).unwrap();
+    }
+
+    {
+        let result = StorageManager::new_file(&temp_db_path);
+        assert!(
+            result.is_err(),
+            "Future schema version 3 must be REJECTED, never silently downgraded!"
+        );
+    }
+    let _ = std::fs::remove_file(temp_db_path);
+    println!("FUTURE SCHEMA REJECT = PASS");
+}
+
+#[test]
+fn test_at_today_session_unavailable() {
+    let mut pipeline = create_test_pipeline("run_at");
+    let mock = MockAdapter::new("run_at");
+    let semantics = generic_semantics();
+
+    let s1 = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_at",
+        Some("req_at"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Delta,
+        false,
+        0,
+        60,
+        0,
+        0,
+        0,
+        1,
+    );
+    pipeline
+        .process_sample(&s1, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    let metrics = pipeline.global_aggregator.compute_global_metrics(
+        &mut pipeline.tps_engine,
+        1_000_000_000,
+        "run_at",
+    );
+
+    assert_eq!(
+        metrics.today_tokens, None,
+        "Today tokens must be None (no committed aggregate provider)!"
+    );
+    assert_eq!(
+        metrics.session_tokens, None,
+        "Session tokens must be None (no committed aggregate provider)!"
+    );
+    println!("TODAY SESSION UNAVAILABLE = PASS");
 }
 
 #[test]

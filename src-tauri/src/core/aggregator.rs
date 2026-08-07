@@ -10,8 +10,9 @@ pub struct GlobalAggregatedMetrics {
     pub in_coverage_total: usize,
     pub generating_agents_count: usize,
     pub working_agents_count: usize,
-    pub today_tokens: u64,
-    pub session_tokens: u64,
+    // Freeze Patch Fix 4: No committed aggregate provider yet -> always None (never fake 0!)
+    pub today_tokens: Option<u64>,
+    pub session_tokens: Option<u64>,
     pub peak_out_tps: f64,
 }
 
@@ -47,8 +48,6 @@ impl GlobalAggregator {
         let mut in_measured = 0;
         let mut generating_count = 0;
         let mut working_count = 0;
-        let mut today_tokens = 0u64;
-        let mut session_tokens = 0u64;
 
         let total_agents = self.agent_statuses.len();
 
@@ -72,9 +71,6 @@ impl GlobalAggregator {
                 global_in_tps_sum += in_val;
                 in_measured += 1;
             }
-
-            today_tokens += status.today_tokens;
-            session_tokens += status.session_tokens;
         }
 
         // P0-16 Fix: Global Peak is the max of historical GLOBAL OUT TPS over time!
@@ -94,8 +90,9 @@ impl GlobalAggregator {
             in_coverage_total: total_agents,
             generating_agents_count: generating_count,
             working_agents_count: working_count,
-            today_tokens,
-            session_tokens,
+            // Freeze Patch Fix 4: No aggregate source -> Unavailable (None)
+            today_tokens: None,
+            session_tokens: None,
             peak_out_tps: global_peak,
         }
     }

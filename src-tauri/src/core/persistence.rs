@@ -5,6 +5,27 @@ use crate::core::types::{
 use rusqlite::{params, Connection, Result};
 use std::path::Path;
 
+pub const CURRENT_SCHEMA_VERSION: i32 = 2;
+
+#[derive(Debug, Clone)]
+pub enum SchemaError {
+    UnsupportedFutureSchemaVersion(i32),
+    UpgradeFailed(String),
+}
+
+impl std::fmt::Display for SchemaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SchemaError::UnsupportedFutureSchemaVersion(v) => {
+                write!(f, "Unsupported future schema version: {}", v)
+            }
+            SchemaError::UpgradeFailed(e) => write!(f, "Schema upgrade failed: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for SchemaError {}
+
 pub struct StorageManager {
     conn: Connection,
 }
@@ -12,76 +33,87 @@ pub struct StorageManager {
 impl StorageManager {
     pub fn new_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        let storage = Self { conn };
+        let mut storage = Self { conn };
         storage.init_schema()?;
         Ok(storage)
     }
 
     pub fn new_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let conn = Connection::open(path)?;
-        let storage = Self { conn };
+        let mut storage = Self { conn };
         storage.init_schema()?;
         Ok(storage)
     }
 
-    pub fn init_schema(&self) -> Result<()> {
-        let mut user_ver: i32 = self
+    pub fn init_schema(&mut self) -> Result<()> {
+        let user_ver: i32 = self
             .conn
             .query_row("PRAGMA user_version;", [], |r| r.get(0))
             .unwrap_or(0);
 
-        if user_ver < 2 {
-            // Fix 7: Safe Pre-release Schema Upgrade Policy
-            // Check if old incompatible schema exists and drop development tables cleanly
-            let table_exists: bool = self
-                .conn
-                .query_row(
-                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='canonical_request_ledgers';",
-                    [],
-                    |r| r.get::<_, i32>(0),
-                )
-                .map(|c| c > 0)
-                .unwrap_or(false);
-
-            if table_exists {
-                // Inspect table columns to verify compatibility
-                let has_new_col: bool = self
-                    .conn
-                    .prepare("PRAGMA table_info(canonical_request_ledgers);")
-                    .and_then(|mut stmt| {
-                        let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
-                        let mut found = false;
-                        for col in rows {
-                            if col.unwrap_or_default() == "canonical_context_input_total" {
-                                found = true;
-                                break;
-                            }
-                        }
-                        Ok(found)
-                    })
-                    .unwrap_or(false);
-
-                if !has_new_col {
-                    // Rebuild development tables for v2 schema
-                    self.conn.execute_batch(
-                        "
-                        DROP TABLE IF EXISTS canonical_token_deltas;
-                        DROP TABLE IF EXISTS canonical_corrections;
-                        DROP TABLE IF EXISTS canonical_request_ledgers;
-                        ",
-                    )?;
-                }
-            }
-
-            self.conn.execute_batch("PRAGMA user_version = 2;")?;
-            user_ver = 2;
+        // Freeze Patch Fix 3: Future schema version must be REJECTED, never silently opened!
+        if user_ver > CURRENT_SCHEMA_VERSION {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::ErrorCode::NotADatabase as i32),
+                Some(format!(
+                    "Unsupported future schema version {} (current: {})",
+                    user_ver, CURRENT_SCHEMA_VERSION
+                )),
+            ));
         }
 
-        self.conn.execute_batch(
-            "
-            PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = NORMAL;
+        if user_ver < CURRENT_SCHEMA_VERSION {
+            // Freeze Patch Fix 3: Atomic Pre-release Development DB Reset!
+            // 1. WAL / synchronous
+            self.conn.execute_batch(
+                "
+                PRAGMA journal_mode = WAL;
+                PRAGMA synchronous = NORMAL;
+                ",
+            )?;
 
+            // 2. BEGIN IMMEDIATE
+            let tx = self.conn.transaction()?;
+
+            // 3. Clean ALL old internal metering tables
+            tx.execute_batch(
+                "
+                DROP TABLE IF EXISTS canonical_token_deltas;
+                DROP TABLE IF EXISTS canonical_corrections;
+                DROP TABLE IF EXISTS canonical_request_ledgers;
+                DROP TABLE IF EXISTS source_checkpoints;
+                DROP TABLE IF EXISTS agent_status;
+                DROP TABLE IF EXISTS collector_runs;
+                ",
+            )?;
+
+            // 4. Create all current schema tables
+            Self::create_current_schema(&tx)?;
+
+            // 5. Set PRAGMA user_version = 2
+            tx.execute_batch("PRAGMA user_version = 2;")?;
+
+            // 6. COMMIT
+            tx.commit()?;
+        } else {
+            // Schema already at current version: just ensure tables exist
+            self.conn.execute_batch(
+                "
+                PRAGMA journal_mode = WAL;
+                PRAGMA synchronous = NORMAL;
+                ",
+            )?;
+            let tx = self.conn.transaction()?;
+            Self::create_current_schema(&tx)?;
+            tx.commit()?;
+        }
+
+        Ok(())
+    }
+
+    fn create_current_schema(tx: &rusqlite::Transaction) -> Result<()> {
+        tx.execute_batch(
+            "
             CREATE TABLE IF NOT EXISTS collector_runs (
                 run_id TEXT PRIMARY KEY,
                 started_wall_ms INTEGER NOT NULL,
@@ -190,8 +222,6 @@ impl StorageManager {
             );
             ",
         )?;
-
-        let _ = user_ver; // Suppress unused variable warning
         Ok(())
     }
 

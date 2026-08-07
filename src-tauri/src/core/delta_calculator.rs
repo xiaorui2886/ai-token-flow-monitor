@@ -91,6 +91,17 @@ impl DeltaCalculator {
             measurement_kind: sample.measurement_kind,
             gap_state,
             source_priority: sample.source_priority,
+            // Freeze Patch Fix 1: Preserve source cumulative position for cumulative snapshots (None for native delta)
+            source_cumulative_context_input: if sample.is_cumulative {
+                Some(normalized.normalized_context_input_tokens)
+            } else {
+                None
+            },
+            source_cumulative_output: if sample.is_cumulative {
+                Some(normalized.normalized_output_tokens)
+            } else {
+                None
+            },
         })
     }
 }

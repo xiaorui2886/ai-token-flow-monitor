@@ -115,8 +115,8 @@ impl EnginePipeline {
             current_in_tps: None,
             current_out_tps: 0.0,
             interval_avg_metric: None,
-            today_tokens: 0,
-            session_tokens: 0,
+            today_tokens: None,
+            session_tokens: None,
             token_accuracy: sample.token_accuracy,
             temporal_accuracy: sample.temporal_accuracy,
             last_updated_at_ms: sample.wall_timestamp_ms,
@@ -156,18 +156,31 @@ impl EnginePipeline {
                 .calculate(sample, &normalized, &correlation, mode)
         {
             if let Some(canonical_delta) = self.reconciler.reconcile(&raw_delta) {
-                // Check if request is already finalized (Fix 4)
+                // Freeze Patch Fix 2: Finalized Request MUST NOT produce canonical live delta!
                 let is_finalized = self
                     .request_ledger
                     .get_ledger(&canonical_delta.correlation_key)
                     .map(|l| l.is_finalized)
                     .unwrap_or(false);
 
-                self.request_ledger.record_live_delta(&canonical_delta);
+                if is_finalized {
+                    // Consume checkpoint safely (checkpoint-only transaction) without canonical delta
+                    if let Some(cp) = checkpoint {
+                        let mut storage_guard = self.storage.lock();
+                        if let Err(e) =
+                            storage_guard.save_canonical_transaction(&[], &[], &[], Some(cp))
+                        {
+                            return Err(EngineError::StorageError(e.to_string()));
+                        }
+                    }
 
-                if !is_finalized {
-                    self.tps_engine.push_delta(&canonical_delta);
+                    return Ok(ProcessOutcome::Rejected {
+                        reason: "request_finalized_late_event".to_string(),
+                    });
                 }
+
+                self.request_ledger.record_live_delta(&canonical_delta);
+                self.tps_engine.push_delta(&canonical_delta);
 
                 let mut storage_guard = self.storage.lock();
                 if let Some(ledger) = self
