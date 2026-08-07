@@ -1,1 +1,2 @@
-fatal: your current branch 'main' does not have any commits yet
+1a35192 ci: add core engine github actions workflow
+0930e98 core: establish verified token metering engine baseline
