@@ -67,56 +67,71 @@ impl BaselineTracker {
         let state_key = (source_adapter_id.to_string(), key.clone());
 
         if let Some(state) = self.states.get_mut(&state_key) {
-            // Check for counter decrease (e.g. output < state.last_output)
-            if output < state.last_output {
-                if is_explicit_reset || mode == BaselineMode::ContinuousEpoch {
-                    // Explicit new epoch/generation reset
-                    state.generation_id += 1;
-                    state.last_context_input = context_input;
-                    state.last_fresh_input = fresh_input;
-                    state.last_output = output;
-                    state.last_cache_read = cache_read;
-                    state.last_cache_write = cache_write;
-                    state.last_reasoning = reasoning;
-                    state.watermark_output = output;
+            // Multi-Field Consistency Freeze:
+            // ONLY explicit counter_reset_hint can establish a new epoch.
+            // ContinuousEpoch alone must NOT trigger reset.
+            if is_explicit_reset {
+                // New epoch: all 6 counters restart from new 0-origin
+                state.generation_id += 1;
+                state.last_context_input = context_input;
+                state.last_fresh_input = fresh_input;
+                state.last_output = output;
+                state.last_cache_read = cache_read;
+                state.last_cache_write = cache_write;
+                state.last_reasoning = reasoning;
+                state.watermark_output = output;
 
-                    return CounterDeltas {
-                        delta_context_input: context_input,
-                        delta_fresh_input: fresh_input,
-                        delta_output: output,
-                        delta_cache_read: cache_read,
-                        delta_cache_write: cache_write,
-                        delta_reasoning: reasoning,
-                        is_late_old_sample: false,
-                    };
-                } else {
-                    // P0-3: Out-of-order late old snapshot (e.g. 150 < 180)
-                    return CounterDeltas {
-                        delta_context_input: 0,
-                        delta_fresh_input: 0,
-                        delta_output: 0,
-                        delta_cache_read: 0,
-                        delta_cache_write: 0,
-                        delta_reasoning: 0,
-                        is_late_old_sample: true,
-                    };
-                }
+                return CounterDeltas {
+                    delta_context_input: context_input,
+                    delta_fresh_input: fresh_input,
+                    delta_output: output,
+                    delta_cache_read: cache_read,
+                    delta_cache_write: cache_write,
+                    delta_reasoning: reasoning,
+                    is_late_old_sample: false,
+                };
             }
 
-            // Normal sequential snapshot deltas for ALL 6 counters (P0-1)
-            let d_context_in = output_delta(context_input, state.last_context_input);
-            let d_fresh_in = output_delta(fresh_input, state.last_fresh_input);
-            let d_output = output_delta(output, state.last_output);
-            let d_cache_read = output_delta(cache_read, state.last_cache_read);
-            let d_cache_write = output_delta(cache_write, state.last_cache_write);
-            let d_reasoning = output_delta(reasoning, state.last_reasoning);
+            // Output decrease without reset hint -> late/stale/uncertain snapshot: no new delta at all
+            if output < state.last_output {
+                return CounterDeltas {
+                    delta_context_input: 0,
+                    delta_fresh_input: 0,
+                    delta_output: 0,
+                    delta_cache_read: 0,
+                    delta_cache_write: 0,
+                    delta_reasoning: 0,
+                    is_late_old_sample: true,
+                };
+            }
 
-            state.last_context_input = context_input;
-            state.last_fresh_input = fresh_input;
+            // Per-field monotonic deltas:
+            // - current >= last -> current - last
+            // - current < last (non-output, no reset) -> 0, keep last known safe position (watermark)
+            let d_context_in = monotonic_delta(context_input, state.last_context_input);
+            let d_fresh_in = monotonic_delta(fresh_input, state.last_fresh_input);
+            let d_output = output - state.last_output; // guaranteed >= by late-sample check above
+            let d_cache_read = monotonic_delta(cache_read, state.last_cache_read);
+            let d_cache_write = monotonic_delta(cache_write, state.last_cache_write);
+            let d_reasoning = monotonic_delta(reasoning, state.last_reasoning);
+
+            // Update last positions ONLY for non-decreased counters
+            if context_input >= state.last_context_input {
+                state.last_context_input = context_input;
+            }
+            if fresh_input >= state.last_fresh_input {
+                state.last_fresh_input = fresh_input;
+            }
             state.last_output = output;
-            state.last_cache_read = cache_read;
-            state.last_cache_write = cache_write;
-            state.last_reasoning = reasoning;
+            if cache_read >= state.last_cache_read {
+                state.last_cache_read = cache_read;
+            }
+            if cache_write >= state.last_cache_write {
+                state.last_cache_write = cache_write;
+            }
+            if reasoning >= state.last_reasoning {
+                state.last_reasoning = reasoning;
+            }
 
             if output > state.watermark_output {
                 state.watermark_output = output;
@@ -190,10 +205,8 @@ impl BaselineTracker {
     }
 }
 
-fn output_delta(curr: u64, last: u64) -> u64 {
-    if curr >= last {
-        curr - last
-    } else {
-        curr
-    }
+/// Multi-Field Consistency Freeze: monotonic counter delta helper.
+/// current >= last -> current - last. current < last (no reset evidence) -> 0 (decrease state).
+fn monotonic_delta(curr: u64, last: u64) -> u64 {
+    curr.saturating_sub(last)
 }

@@ -1,9 +1,30 @@
 use crate::core::types::{
     CanonicalCorrection, CanonicalRequestLedger, CanonicalTokenDelta, RequestCorrelationKey,
-    SourceCheckpoint,
+    SourceCheckpoint, TemporalAccuracy, TokenAccuracy,
 };
 use rusqlite::{params, Connection, Result};
 use std::path::Path;
+
+pub const CURRENT_SCHEMA_VERSION: i32 = 2;
+
+#[derive(Debug, Clone)]
+pub enum SchemaError {
+    UnsupportedFutureSchemaVersion(i32),
+    UpgradeFailed(String),
+}
+
+impl std::fmt::Display for SchemaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SchemaError::UnsupportedFutureSchemaVersion(v) => {
+                write!(f, "Unsupported future schema version: {}", v)
+            }
+            SchemaError::UpgradeFailed(e) => write!(f, "Schema upgrade failed: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for SchemaError {}
 
 pub struct StorageManager {
     conn: Connection,
@@ -12,24 +33,87 @@ pub struct StorageManager {
 impl StorageManager {
     pub fn new_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        let storage = Self { conn };
+        let mut storage = Self { conn };
         storage.init_schema()?;
         Ok(storage)
     }
 
     pub fn new_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let conn = Connection::open(path)?;
-        let storage = Self { conn };
+        let mut storage = Self { conn };
         storage.init_schema()?;
         Ok(storage)
     }
 
-    pub fn init_schema(&self) -> Result<()> {
-        self.conn.execute_batch(
-            "
-            PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = NORMAL;
+    pub fn init_schema(&mut self) -> Result<()> {
+        let user_ver: i32 = self
+            .conn
+            .query_row("PRAGMA user_version;", [], |r| r.get(0))
+            .unwrap_or(0);
 
+        // Freeze Patch Fix 3: Future schema version must be REJECTED, never silently opened!
+        if user_ver > CURRENT_SCHEMA_VERSION {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::ErrorCode::NotADatabase as i32),
+                Some(format!(
+                    "Unsupported future schema version {} (current: {})",
+                    user_ver, CURRENT_SCHEMA_VERSION
+                )),
+            ));
+        }
+
+        if user_ver < CURRENT_SCHEMA_VERSION {
+            // Freeze Patch Fix 3: Atomic Pre-release Development DB Reset!
+            // 1. WAL / synchronous
+            self.conn.execute_batch(
+                "
+                PRAGMA journal_mode = WAL;
+                PRAGMA synchronous = NORMAL;
+                ",
+            )?;
+
+            // 2. BEGIN IMMEDIATE
+            let tx = self.conn.transaction()?;
+
+            // 3. Clean ALL old internal metering tables
+            tx.execute_batch(
+                "
+                DROP TABLE IF EXISTS canonical_token_deltas;
+                DROP TABLE IF EXISTS canonical_corrections;
+                DROP TABLE IF EXISTS canonical_request_ledgers;
+                DROP TABLE IF EXISTS source_checkpoints;
+                DROP TABLE IF EXISTS agent_status;
+                DROP TABLE IF EXISTS collector_runs;
+                ",
+            )?;
+
+            // 4. Create all current schema tables
+            Self::create_current_schema(&tx)?;
+
+            // 5. Set PRAGMA user_version = 2
+            tx.execute_batch("PRAGMA user_version = 2;")?;
+
+            // 6. COMMIT
+            tx.commit()?;
+        } else {
+            // Schema already at current version: just ensure tables exist
+            self.conn.execute_batch(
+                "
+                PRAGMA journal_mode = WAL;
+                PRAGMA synchronous = NORMAL;
+                ",
+            )?;
+            let tx = self.conn.transaction()?;
+            Self::create_current_schema(&tx)?;
+            tx.commit()?;
+        }
+
+        Ok(())
+    }
+
+    fn create_current_schema(tx: &rusqlite::Transaction) -> Result<()> {
+        tx.execute_batch(
+            "
             CREATE TABLE IF NOT EXISTS collector_runs (
                 run_id TEXT PRIMARY KEY,
                 started_wall_ms INTEGER NOT NULL,
@@ -55,7 +139,8 @@ impl StorageManager {
                 request_id TEXT NOT NULL,
                 observed_monotonic_ns INTEGER NOT NULL,
                 wall_timestamp_ms INTEGER NOT NULL,
-                delta_input_tokens INTEGER NOT NULL,
+                delta_context_input_tokens INTEGER NOT NULL,
+                delta_fresh_input_tokens INTEGER NOT NULL,
                 delta_output_tokens INTEGER NOT NULL,
                 delta_cache_read INTEGER NOT NULL,
                 delta_cache_write INTEGER NOT NULL,
@@ -76,7 +161,8 @@ impl StorageManager {
                 session_id TEXT NOT NULL,
                 request_id TEXT NOT NULL,
                 wall_timestamp_ms INTEGER NOT NULL,
-                input_correction INTEGER NOT NULL,
+                context_input_correction INTEGER NOT NULL,
+                fresh_input_correction INTEGER NOT NULL,
                 output_correction INTEGER NOT NULL,
                 cache_read_correction INTEGER NOT NULL,
                 cache_write_correction INTEGER NOT NULL,
@@ -94,23 +180,28 @@ impl StorageManager {
                 request_id TEXT NOT NULL,
                 model TEXT NOT NULL,
                 provider TEXT NOT NULL,
-                canonical_input_total INTEGER NOT NULL,
+                canonical_context_input_total INTEGER NOT NULL,
+                canonical_fresh_input_total INTEGER NOT NULL,
                 canonical_output_total INTEGER NOT NULL,
                 canonical_cache_read INTEGER NOT NULL,
                 canonical_cache_write INTEGER NOT NULL,
                 canonical_reasoning INTEGER NOT NULL,
-                live_contributed_input INTEGER NOT NULL,
+                live_contributed_context_input INTEGER NOT NULL,
+                live_contributed_fresh_input INTEGER NOT NULL,
                 live_contributed_output INTEGER NOT NULL,
                 live_contributed_cache_read INTEGER NOT NULL,
                 live_contributed_cache_write INTEGER NOT NULL,
                 live_contributed_reasoning INTEGER NOT NULL,
-                authoritative_final_input INTEGER,
+                authoritative_final_context_input INTEGER,
+                authoritative_final_fresh_input INTEGER,
                 authoritative_final_output INTEGER,
                 authoritative_final_cache_read INTEGER,
                 authoritative_final_cache_write INTEGER,
                 authoritative_final_reasoning INTEGER,
                 winning_source TEXT NOT NULL,
                 active_live_source_priority INTEGER NOT NULL,
+                active_live_token_accuracy TEXT NOT NULL,
+                active_live_temporal_accuracy TEXT NOT NULL,
                 is_finalized INTEGER NOT NULL,
                 normalization_version INTEGER NOT NULL,
                 last_reconciled_at_ms INTEGER NOT NULL,
@@ -156,10 +247,10 @@ impl StorageManager {
                 "INSERT OR IGNORE INTO canonical_token_deltas (
                     delta_id, collector_run_id, stable_ingestion_id, source_adapter_id,
                     agent_id, session_id, request_id, observed_monotonic_ns, wall_timestamp_ms,
-                    delta_input_tokens, delta_output_tokens, delta_cache_read, delta_cache_write,
-                    delta_reasoning, delta_total, token_accuracy, temporal_accuracy,
-                    measurement_kind, gap_state, source_priority
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                    delta_context_input_tokens, delta_fresh_input_tokens, delta_output_tokens,
+                    delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
+                    token_accuracy, temporal_accuracy, measurement_kind, gap_state, source_priority
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
                 params![
                     d.delta_id,
                     d.collector_run_id,
@@ -170,7 +261,8 @@ impl StorageManager {
                     d.correlation_key.request_id,
                     d.observed_monotonic_ns,
                     d.wall_timestamp_ms,
-                    d.delta_input_tokens,
+                    d.delta_context_input_tokens,
+                    d.delta_fresh_input_tokens,
                     d.delta_output_tokens,
                     d.delta_cache_read,
                     d.delta_cache_write,
@@ -189,10 +281,10 @@ impl StorageManager {
             tx.execute(
                 "INSERT OR REPLACE INTO canonical_corrections (
                     correction_id, collector_run_id, agent_id, session_id, request_id,
-                    wall_timestamp_ms, input_correction, output_correction,
-                    cache_read_correction, cache_write_correction, reasoning_correction,
-                    reason, old_source, new_authoritative_source, old_total, new_total
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                    wall_timestamp_ms, context_input_correction, fresh_input_correction,
+                    output_correction, cache_read_correction, cache_write_correction,
+                    reasoning_correction, reason, old_source, new_authoritative_source, old_total, new_total
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 params![
                     c.correction_id,
                     c.collector_run_id,
@@ -200,7 +292,8 @@ impl StorageManager {
                     c.correlation_key.session_id,
                     c.correlation_key.request_id,
                     c.wall_timestamp_ms,
-                    c.input_correction,
+                    c.context_input_correction,
+                    c.fresh_input_correction,
                     c.output_correction,
                     c.cache_read_correction,
                     c.cache_write_correction,
@@ -218,37 +311,43 @@ impl StorageManager {
             tx.execute(
                 "INSERT OR REPLACE INTO canonical_request_ledgers (
                     agent_id, session_id, request_id, model, provider,
-                    canonical_input_total, canonical_output_total, canonical_cache_read,
-                    canonical_cache_write, canonical_reasoning,
-                    live_contributed_input, live_contributed_output, live_contributed_cache_read,
-                    live_contributed_cache_write, live_contributed_reasoning,
-                    authoritative_final_input, authoritative_final_output, authoritative_final_cache_read,
-                    authoritative_final_cache_write, authoritative_final_reasoning,
-                    winning_source, active_live_source_priority, is_finalized, normalization_version, last_reconciled_at_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+                    canonical_context_input_total, canonical_fresh_input_total, canonical_output_total,
+                    canonical_cache_read, canonical_cache_write, canonical_reasoning,
+                    live_contributed_context_input, live_contributed_fresh_input, live_contributed_output,
+                    live_contributed_cache_read, live_contributed_cache_write, live_contributed_reasoning,
+                    authoritative_final_context_input, authoritative_final_fresh_input, authoritative_final_output,
+                    authoritative_final_cache_read, authoritative_final_cache_write, authoritative_final_reasoning,
+                    winning_source, active_live_source_priority, active_live_token_accuracy, active_live_temporal_accuracy,
+                    is_finalized, normalization_version, last_reconciled_at_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
                 params![
                     l.correlation_key.agent_id,
                     l.correlation_key.session_id,
                     l.correlation_key.request_id,
                     l.model,
                     l.provider,
-                    l.canonical_input_total,
+                    l.canonical_context_input_total,
+                    l.canonical_fresh_input_total,
                     l.canonical_output_total,
                     l.canonical_cache_read,
                     l.canonical_cache_write,
                     l.canonical_reasoning,
-                    l.live_contributed_input,
+                    l.live_contributed_context_input,
+                    l.live_contributed_fresh_input,
                     l.live_contributed_output,
                     l.live_contributed_cache_read,
                     l.live_contributed_cache_write,
                     l.live_contributed_reasoning,
-                    l.authoritative_final_input,
+                    l.authoritative_final_context_input,
+                    l.authoritative_final_fresh_input,
                     l.authoritative_final_output,
                     l.authoritative_final_cache_read,
                     l.authoritative_final_cache_write,
                     l.authoritative_final_reasoning,
                     l.winning_source,
                     l.active_live_source_priority,
+                    format!("{:?}", l.active_live_token_accuracy),
+                    format!("{:?}", l.active_live_temporal_accuracy),
                     if l.is_finalized { 1 } else { 0 },
                     l.normalization_version,
                     l.last_reconciled_at_ms,
@@ -279,13 +378,14 @@ impl StorageManager {
     pub fn load_ledgers(&self) -> Result<Vec<CanonicalRequestLedger>> {
         let mut stmt = self.conn.prepare(
             "SELECT agent_id, session_id, request_id, model, provider,
-                    canonical_input_total, canonical_output_total, canonical_cache_read,
-                    canonical_cache_write, canonical_reasoning,
-                    live_contributed_input, live_contributed_output, live_contributed_cache_read,
-                    live_contributed_cache_write, live_contributed_reasoning,
-                    authoritative_final_input, authoritative_final_output, authoritative_final_cache_read,
-                    authoritative_final_cache_write, authoritative_final_reasoning,
-                    winning_source, active_live_source_priority, is_finalized, normalization_version, last_reconciled_at_ms
+                    canonical_context_input_total, canonical_fresh_input_total, canonical_output_total,
+                    canonical_cache_read, canonical_cache_write, canonical_reasoning,
+                    live_contributed_context_input, live_contributed_fresh_input, live_contributed_output,
+                    live_contributed_cache_read, live_contributed_cache_write, live_contributed_reasoning,
+                    authoritative_final_context_input, authoritative_final_fresh_input, authoritative_final_output,
+                    authoritative_final_cache_read, authoritative_final_cache_write, authoritative_final_reasoning,
+                    winning_source, active_live_source_priority, active_live_token_accuracy, active_live_temporal_accuracy,
+                    is_finalized, normalization_version, last_reconciled_at_ms
              FROM canonical_request_ledgers",
         )?;
 
@@ -293,7 +393,9 @@ impl StorageManager {
             let agent_id: String = row.get(0)?;
             let session_id: String = row.get(1)?;
             let request_id: String = row.get(2)?;
-            let is_finalized_int: i32 = row.get(22)?;
+            let token_acc_str: String = row.get(25)?;
+            let temp_acc_str: String = row.get(26)?;
+            let is_finalized_int: i32 = row.get(27)?;
 
             Ok(CanonicalRequestLedger {
                 correlation_key: RequestCorrelationKey {
@@ -304,26 +406,31 @@ impl StorageManager {
                 agent_id,
                 model: row.get(3)?,
                 provider: row.get(4)?,
-                canonical_input_total: row.get(5)?,
-                canonical_output_total: row.get(6)?,
-                canonical_cache_read: row.get(7)?,
-                canonical_cache_write: row.get(8)?,
-                canonical_reasoning: row.get(9)?,
-                live_contributed_input: row.get(10)?,
-                live_contributed_output: row.get(11)?,
-                live_contributed_cache_read: row.get(12)?,
-                live_contributed_cache_write: row.get(13)?,
-                live_contributed_reasoning: row.get(14)?,
-                authoritative_final_input: row.get(15)?,
-                authoritative_final_output: row.get(16)?,
-                authoritative_final_cache_read: row.get(17)?,
-                authoritative_final_cache_write: row.get(18)?,
-                authoritative_final_reasoning: row.get(19)?,
-                winning_source: row.get(20)?,
-                active_live_source_priority: row.get(21)?,
+                canonical_context_input_total: row.get(5)?,
+                canonical_fresh_input_total: row.get(6)?,
+                canonical_output_total: row.get(7)?,
+                canonical_cache_read: row.get(8)?,
+                canonical_cache_write: row.get(9)?,
+                canonical_reasoning: row.get(10)?,
+                live_contributed_context_input: row.get(11)?,
+                live_contributed_fresh_input: row.get(12)?,
+                live_contributed_output: row.get(13)?,
+                live_contributed_cache_read: row.get(14)?,
+                live_contributed_cache_write: row.get(15)?,
+                live_contributed_reasoning: row.get(16)?,
+                authoritative_final_context_input: row.get(17)?,
+                authoritative_final_fresh_input: row.get(18)?,
+                authoritative_final_output: row.get(19)?,
+                authoritative_final_cache_read: row.get(20)?,
+                authoritative_final_cache_write: row.get(21)?,
+                authoritative_final_reasoning: row.get(22)?,
+                winning_source: row.get(23)?,
+                active_live_source_priority: row.get(24)?,
+                active_live_token_accuracy: parse_token_acc(&token_acc_str),
+                active_live_temporal_accuracy: parse_temporal_acc(&temp_acc_str),
                 is_finalized: is_finalized_int != 0,
-                normalization_version: row.get(23)?,
-                last_reconciled_at_ms: row.get(24)?,
+                normalization_version: row.get(28)?,
+                last_reconciled_at_ms: row.get(29)?,
             })
         })?;
 
@@ -374,5 +481,24 @@ impl StorageManager {
         )?;
         let total: u64 = stmt.query_row(params![agent_id], |row| row.get(0))?;
         Ok(total)
+    }
+}
+
+fn parse_token_acc(s: &str) -> TokenAccuracy {
+    match s {
+        "Exact" => TokenAccuracy::Exact,
+        "Measured" => TokenAccuracy::Measured,
+        "Estimated" => TokenAccuracy::Estimated,
+        _ => TokenAccuracy::Unavailable,
+    }
+}
+
+fn parse_temporal_acc(s: &str) -> TemporalAccuracy {
+    match s {
+        "StreamExact" => TemporalAccuracy::StreamExact,
+        "IntervalExact" => TemporalAccuracy::IntervalExact,
+        "TurnExact" => TemporalAccuracy::TurnExact,
+        "Estimated" => TemporalAccuracy::Estimated,
+        _ => TemporalAccuracy::Unavailable,
     }
 }

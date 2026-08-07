@@ -120,6 +120,7 @@ impl MockAdapter {
             event_kind: kind,
             is_cumulative,
             is_final: kind == EventKind::Final,
+            counter_reset_hint: false,
             raw_usage: RawUsage {
                 raw_input_tokens: Some(input),
                 raw_output_tokens: Some(output),
@@ -134,6 +135,7 @@ impl MockAdapter {
                 last_token_ms: Some(wall_ms),
                 prefill_start_ms: None,
                 prefill_end_ms: None,
+                measurement_interval_ms: None,
             },
             source_priority,
             token_accuracy: token_acc,

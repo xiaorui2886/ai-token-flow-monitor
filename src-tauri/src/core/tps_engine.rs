@@ -1,5 +1,6 @@
 use crate::core::types::{
-    CanonicalTokenDelta, GapState, InputThroughputMetric, MeasurementKind, TemporalAccuracy,
+    CanonicalTokenDelta, GapState, InputThroughputMetric, IntervalAverageMetric, MeasurementKind,
+    TemporalAccuracy,
 };
 use std::collections::{HashMap, VecDeque};
 
@@ -21,12 +22,15 @@ pub struct AgentTpsMetrics {
     pub avg_5s_out_tps: f64,
     pub current_in_tps: Option<f64>,
     pub input_metric: InputThroughputMetric,
+    pub interval_avg_metric: Option<IntervalAverageMetric>,
     pub peak_out_tps: f64,
 }
 
 pub struct TPSEngine {
     agent_buffers: HashMap<String, VecDeque<TokenSampleRecord>>,
     agent_peaks: HashMap<String, f64>,
+    agent_last_in_metrics: HashMap<String, (String, u64, Option<f64>, InputThroughputMetric)>,
+    agent_interval_metrics: HashMap<String, IntervalAverageMetric>,
     global_peak: f64,
 }
 
@@ -41,6 +45,8 @@ impl TPSEngine {
         Self {
             agent_buffers: HashMap::new(),
             agent_peaks: HashMap::new(),
+            agent_last_in_metrics: HashMap::new(),
+            agent_interval_metrics: HashMap::new(),
             global_peak: 0.0,
         }
     }
@@ -50,11 +56,55 @@ impl TPSEngine {
             collector_run_id: delta.collector_run_id.clone(),
             monotonic_ns: delta.observed_monotonic_ns,
             delta_out: delta.delta_output_tokens,
-            delta_in: delta.delta_input_tokens,
+            delta_in: delta.delta_context_input_tokens,
             gap_state: delta.gap_state,
             temporal_accuracy: delta.temporal_accuracy,
             measurement_kind: delta.measurement_kind,
         };
+
+        // Fix 1: Compute IntervalAverageMetric dynamically from measurement_interval_ms (no hardcoded 2s!)
+        if delta.temporal_accuracy == TemporalAccuracy::IntervalExact
+            && delta.delta_output_tokens > 0
+        {
+            let (dur_sec, tps) = if let Some(ms) = delta.timing.measurement_interval_ms {
+                if ms > 0 {
+                    let sec = ms as f64 / 1000.0;
+                    (Some(sec), Some(delta.delta_output_tokens as f64 / sec))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+
+            self.agent_interval_metrics.insert(
+                delta.agent_id.clone(),
+                IntervalAverageMetric {
+                    interval_tokens: delta.delta_output_tokens,
+                    interval_duration_sec: dur_sec,
+                    interval_tps: tps,
+                },
+            );
+        }
+
+        // Fix 4: Compute & store InputThroughputMetric with freshness timestamp (ns)
+        let in_metric = self.compute_input_metric(delta);
+        let in_tps_val = match in_metric {
+            InputThroughputMetric::PrefillExact(v) => Some(v),
+            InputThroughputMetric::EffectiveMeasured(v) => Some(v),
+            InputThroughputMetric::Unavailable => None,
+        };
+        if in_tps_val.is_some() {
+            self.agent_last_in_metrics.insert(
+                delta.agent_id.clone(),
+                (
+                    delta.collector_run_id.clone(),
+                    delta.observed_monotonic_ns,
+                    in_tps_val,
+                    in_metric,
+                ),
+            );
+        }
 
         let buffer = self
             .agent_buffers
@@ -94,13 +144,11 @@ impl TPSEngine {
                 continue;
             }
             if current_monotonic_ns.saturating_sub(r.monotonic_ns) <= window_1s_ns {
-                // P0-6: Exclude CatchUp / Stale / TurnExact / Unavailable tokens from 1s Instant Live OUT TPS
-                if r.gap_state == GapState::CatchUp || r.gap_state == GapState::Stale {
+                // P0-1 & Fix 5: ONLY StreamExact with GapState::Normal and not TokenizerEstimate can enter Instant 1s Live OUT TPS!
+                if r.temporal_accuracy != TemporalAccuracy::StreamExact {
                     continue;
                 }
-                if r.temporal_accuracy == TemporalAccuracy::TurnExact
-                    || r.temporal_accuracy == TemporalAccuracy::Unavailable
-                {
+                if r.gap_state != GapState::Normal {
                     continue;
                 }
                 if r.measurement_kind == MeasurementKind::TokenizerEstimate {
@@ -114,12 +162,22 @@ impl TPSEngine {
 
         let current_out_tps = out_1s_tokens as f64;
 
-        // Calculate 5s average OUT TPS
+        // Fix 5: Calculate 5s Live Average using Live Eligibility ONLY (StreamExact, GapState::Normal, not TokenizerEstimate)
         let mut out_5s_tokens = 0u64;
         let mut oldest_ns = current_monotonic_ns;
 
         for r in buffer.iter() {
             if r.collector_run_id == current_run_id {
+                if r.temporal_accuracy != TemporalAccuracy::StreamExact {
+                    continue;
+                }
+                if r.gap_state != GapState::Normal {
+                    continue;
+                }
+                if r.measurement_kind == MeasurementKind::TokenizerEstimate {
+                    continue;
+                }
+
                 out_5s_tokens += r.delta_out;
                 if r.monotonic_ns < oldest_ns {
                     oldest_ns = r.monotonic_ns;
@@ -136,11 +194,28 @@ impl TPSEngine {
             *peak = current_out_tps;
         }
 
+        // Fix 4: Current IN TPS Freshness window (1 second = 1_000_000_000 ns)
+        let (in_val, in_metric) = if let Some((run_id, ns, val, metric)) =
+            self.agent_last_in_metrics.get(agent_id)
+        {
+            if run_id == current_run_id && current_monotonic_ns.saturating_sub(*ns) <= 1_000_000_000
+            {
+                (*val, metric.clone())
+            } else {
+                (None, InputThroughputMetric::Unavailable)
+            }
+        } else {
+            (None, InputThroughputMetric::Unavailable)
+        };
+
+        let interval_metric = self.agent_interval_metrics.get(agent_id).cloned();
+
         AgentTpsMetrics {
             current_out_tps,
             avg_5s_out_tps,
-            current_in_tps: None,
-            input_metric: InputThroughputMetric::Unavailable,
+            current_in_tps: in_val,
+            input_metric: in_metric,
+            interval_avg_metric: interval_metric,
             peak_out_tps: *peak,
         }
     }
@@ -152,7 +227,7 @@ impl TPSEngine {
             let dur_sec = (end - start) as f64 / 1000.0;
             if dur_sec > 0.0 {
                 return InputThroughputMetric::PrefillExact(
-                    delta.delta_input_tokens as f64 / dur_sec,
+                    delta.delta_context_input_tokens as f64 / dur_sec,
                 );
             }
         }
@@ -162,7 +237,7 @@ impl TPSEngine {
             let ttft_sec = (first - start) as f64 / 1000.0;
             if ttft_sec > 0.0 {
                 return InputThroughputMetric::EffectiveMeasured(
-                    delta.delta_input_tokens as f64 / ttft_sec,
+                    delta.delta_context_input_tokens as f64 / ttft_sec,
                 );
             }
         }

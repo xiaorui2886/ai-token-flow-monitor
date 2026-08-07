@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use crate::core::types::{
     BaselineMode, CanonicalTokenDelta, CorrelationResult, NormalizedUsage, RawSourceSample,
-    TemporalAccuracy,
+    TemporalAccuracy, UsageAccountingStrategy,
 };
 
 pub struct DeltaCalculator {
@@ -53,7 +53,8 @@ impl DeltaCalculator {
         );
 
         // Skip producing empty deltas
-        if acc_delta.delta_input == 0
+        if acc_delta.delta_context_input == 0
+            && acc_delta.delta_fresh_input == 0
             && acc_delta.delta_output == 0
             && acc_delta.delta_cache_read == 0
             && acc_delta.delta_cache_write == 0
@@ -63,6 +64,57 @@ impl DeltaCalculator {
         }
 
         let stable_id = generate_stable_ingestion_id(sample);
+
+        // Multi-Field Consistency Freeze: cumulative position per field ONLY if raw field is actually available.
+        // None = source cannot provide this field. Never treat unavailable as known zero.
+        let raw = &sample.raw_usage;
+        let semantics = &normalized.usage_semantics;
+
+        let cum_ctx = if sample.is_cumulative && raw.raw_input_tokens.is_some() {
+            match semantics.accounting_strategy {
+                // AnthropicStyle: full context input requires cache read & creation availability semantics
+                UsageAccountingStrategy::AnthropicStyle => {
+                    if raw.raw_cache_read_tokens.is_some() && raw.raw_cache_write_tokens.is_some() {
+                        Some(normalized.normalized_context_input_tokens)
+                    } else {
+                        None
+                    }
+                }
+                _ => Some(normalized.normalized_context_input_tokens),
+            }
+        } else {
+            None
+        };
+
+        let cum_fresh = if sample.is_cumulative && raw.raw_input_tokens.is_some() {
+            Some(normalized.normalized_fresh_input_tokens)
+        } else {
+            None
+        };
+
+        let cum_out = if sample.is_cumulative && raw.raw_output_tokens.is_some() {
+            Some(normalized.normalized_output_tokens)
+        } else {
+            None
+        };
+
+        let cum_cr = if sample.is_cumulative && raw.raw_cache_read_tokens.is_some() {
+            Some(normalized.cache_read_tokens)
+        } else {
+            None
+        };
+
+        let cum_cw = if sample.is_cumulative && raw.raw_cache_write_tokens.is_some() {
+            Some(normalized.cache_write_tokens)
+        } else {
+            None
+        };
+
+        let cum_reason = if sample.is_cumulative && raw.raw_reasoning_tokens.is_some() {
+            Some(normalized.reasoning_tokens)
+        } else {
+            None
+        };
 
         Some(CanonicalTokenDelta {
             delta_id: format!("delta_{}", Uuid::new_v4()),
@@ -77,7 +129,8 @@ impl DeltaCalculator {
             agent_name: sample.agent_name.clone(),
             model: sample.model.clone(),
             provider: sample.provider.clone(),
-            delta_input_tokens: acc_delta.delta_input,
+            delta_context_input_tokens: acc_delta.delta_context_input,
+            delta_fresh_input_tokens: acc_delta.delta_fresh_input,
             delta_output_tokens: acc_delta.delta_output,
             delta_cache_read: acc_delta.delta_cache_read,
             delta_cache_write: acc_delta.delta_cache_write,
@@ -89,6 +142,12 @@ impl DeltaCalculator {
             measurement_kind: sample.measurement_kind,
             gap_state,
             source_priority: sample.source_priority,
+            source_cumulative_context_input: cum_ctx,
+            source_cumulative_fresh_input: cum_fresh,
+            source_cumulative_output: cum_out,
+            source_cumulative_cache_read: cum_cr,
+            source_cumulative_cache_write: cum_cw,
+            source_cumulative_reasoning: cum_reason,
         })
     }
 }

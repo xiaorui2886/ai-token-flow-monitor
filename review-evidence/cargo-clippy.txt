@@ -1,2 +1,2 @@
-   Compiling ai-token-flow-monitor v0.1.0 (D:\实时Token监控工具\src-tauri)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.24s
+   Compiling ai-token-flow-monitor v0.1.0 (D:\dev\ai-token-flow-monitor\src-tauri)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.13s

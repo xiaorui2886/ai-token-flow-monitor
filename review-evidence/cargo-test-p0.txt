@@ -1,68 +1,90 @@
-   Compiling ai-token-flow-monitor v0.1.0 (D:\实时Token监控工具\src-tauri)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.78s
+   Compiling ai-token-flow-monitor v0.1.0 (D:\dev\ai-token-flow-monitor\src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.57s
      Running tests\p0_tests.rs (target\debug\deps\p0_tests-d2d0f17c97cd0445.exe)
 
-running 31 tests
+running 42 tests
 MULTI AGENT GAP ISOLATION = PASS
+test test_ad_cache_counter_reset ... okSOURCE RANKING ACCURACY > TEMPORAL > PRIORITY = PASS
+
+test test_ac_multi_agent_gap_isolation ... okCONTEXT FRESH INPUT STABILITY = PASS
+
 P0 Test C PASS: Historical Replay Restore (50000 tokens -> delta 0)
 P0 Test D2 PASS: Unknown Reattach (Attach at 200 -> delta 0, next 250 -> delta 50)
+test test_ak_source_ranking_accuracy_temporal_priority ... ok
+test test_ai_context_fresh_input_stability ... ok
 P0 Test D3 PASS: Historical Replay (50000 -> baseline 50000, delta 0)
-P0 Test H PASS: Known New Request (First snapshot 30 -> delta 30)
-test test_ac_multi_agent_gap_isolation ... ok
-test test_ad_cache_counter_reset ... ok
 test test_c_replay_restore ... ok
 test test_d2_unknown_reattach ... ok
 test test_d3_historical_replay ... ok
+FIX3 CORRECTION DOES NOT RESET GENERATION = PASS
+test test_fix3_correction_does_not_reset_generation ... ok
+P0 Test A PASS: Snapshot Accumulation (20->71->133->196 = 196)
+TRUE MIXED ACCURACY COVERAGE = PASS
+END TO END IN TPS = PASS
+test test_a_snapshot_accumulation ... okP0 Test D1 PASS: Known Epoch Restart (500->550, restart 30->70 = 120 total)
+
+P0 Test B PASS: Cross Source Duplicate Reconcile (Proxy/JSONL/SQLite 196 -> 1 count)
+test test_ag_end_to_end_in_tps ... ok
+P0 Test H PASS: Known New Request (First snapshot 30 -> delta 30)
+test test_aj_true_mixed_accuracy_coverage ... ok
+test test_d1_known_epoch_restart ... ok
+CROSS SOURCE HANDOFF RECONCILIATION = PASS
 test test_h_known_new_request ... ok
+FIX1 INTERVAL WITHOUT DURATION = PASS
+test test_b_cross_source_duplicate ... ok
+test test_af_cross_source_handoff_reconciliation ... ok
+test test_fix1_interval_without_duration ... ok
+INTERVAL EXACT INSTANT EXCLUSION = PASS
+REPEATED EQUAL DELTA = PASS
+test test_ae_interval_exact_instant_exclusion ... ok
 OUT OF ORDER = PASS
+FINALIZED REQUEST EXCLUDED FROM INSTANT TPS = PASS
 test test_p_out_of_order_samples ... ok
+P0 Test E PASS: Parallel Agent Speed Aggregation (Codex 60 + Claude 50 + ZCode 30 = 140 OUT TPS)
+test test_ab_repeated_same_size_tps ... ok
 GLOBAL PEAK = PASS
-P0 Test J PASS: Negative Reconciliation (Live 200, Final 196 -> Correction -4, Total 196)
+SOURCE HANDOFF UNCERTAINTY = PASS
+test test_al_finalized_request_excluded_from_instant_tps ... ok
+test test_e_parallel_agent_speed ... ok
+test test_am_source_handoff_uncertainty ... ok
 test test_global_peak_aggregation ... ok
 P0 Test I PASS: Positive Reconciliation (Live 160, Final 196 -> Correction +36, Total 196)
-MIXED ACCURACY COVERAGE = PASS
-P0 Test D1 PASS: Known Epoch Restart (500->550, restart 30->70 = 120 total)
-test test_j_negative_reconciliation ... ok
-P0 Test E PASS: Parallel Agent Speed Aggregation (Codex 60 + Claude 50 + ZCode 30 = 140 OUT TPS)
-P0 Test M PASS: SQLite Primary Key Idempotency (Total remains 50)
-P0 Test Q PASS: Duplicate Same-Source Event Deduplication
 test test_i_positive_reconciliation ... ok
-P0 Test B PASS: Cross Source Duplicate Reconcile (Proxy/JSONL/SQLite 196 -> 1 count)
-test test_f_mixed_accuracy ... ok
-CATCH UP TPS SUPPRESSION = PASS
-P0 Test N PASS: Missing Request ID (Low confidence correlation bypasses false merging)
-test test_e_parallel_agent_speed ... ok
-test test_k_sleep_resume_gap_pipeline ... ok
-test test_b_cross_source_duplicate ... ok
-test test_d1_known_epoch_restart ... ok
-test test_m_sqlite_primary_key_idempotency ... ok
-test test_q_duplicate_same_source_event ... ok
-REPEATED EQUAL DELTA = PASS
-test test_n_missing_request_id ... ok
+P0 Test J PASS: Negative Reconciliation (Live 200, Final 196 -> Correction -4, Total 196)
 P0 Test L PASS: Wall Clock Jump (+10 min wall jump -> Monotonic TPS strictly 60.0 t/s)
-test test_ab_repeated_same_size_tps ... ok
+test test_j_negative_reconciliation ... okP0 Test M PASS: SQLite Primary Key Idempotency (Total remains 50)
+
+P0 Test N PASS: Missing Request ID (Low confidence correlation bypasses false merging)
 test test_l_wall_clock_jump ... ok
+test test_m_sqlite_primary_key_idempotency ... ok
+test test_n_missing_request_id ... ok
+P0 Test Q PASS: Duplicate Same-Source Event Deduplication
+CATCH UP TPS SUPPRESSION = PASS
 REAL CROSS SOURCE PRIORITY = PASS
-P0 Test A PASS: Snapshot Accumulation (20->71->133->196 = 196)
-REPEATED EQUAL DELTA = PASS
+EFFECTIVE IN TPS = PASS
 test test_u_real_cross_source_priority ... ok
-test test_a_snapshot_accumulation ... ok
+test test_k_sleep_resume_gap_pipeline ... ok
+test test_q_duplicate_same_source_event ... ok
+test test_v_effective_in_tps ... ok
+REPEATED EQUAL DELTA = PASS
 P0 Test R PASS: Final Before Late Snapshot Protection
-P0 Test O PASS: Monitor Restart Run ID Isolation
-test test_w_in_unavailable ... ok
 test test_t_repeated_equal_real_delta ... ok
 test test_r_final_before_late_snapshot ... ok
 CUMULATIVE CACHE DELTA = PASS
-EFFECTIVE IN TPS = PASS
-test test_o_monitor_restart_run_id ... ok
 test test_s_cumulative_cache_reasoning_delta ... ok
+test test_w_in_unavailable ... ok
+P0 Test O PASS: Monitor Restart Run ID Isolation
 FINAL ALL FIELD RECONCILIATION = PASS
-test test_v_effective_in_tps ... ok
+test test_o_monitor_restart_run_id ... ok
 test test_x_final_all_field_reconciliation ... ok
+ATOMIC CHECKPOINT REPLAY = PASS
+test test_ah_atomic_checkpoint_replay ... ok
+FIX2 PERSISTENCE ACCURACY RESTORE = PASS
 FINAL LEDGER RELOAD = PASS
+test test_fix2_persistence_accuracy_restore ... ok
 test test_aa_final_persistence_reload ... ok
 STABLE REPLAY IDEMPOTENCY = PASS
 test test_z_stable_source_replay ... ok
 
-test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
 

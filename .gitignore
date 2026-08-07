@@ -33,3 +33,4 @@ private-evidence/
 # OS
 .DS_Store
 Thumbs.db
+LOCAL_TEST_REPORT.md

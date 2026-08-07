@@ -22,7 +22,7 @@ use crate::core::request_ledger::RequestLedgerManager;
 use crate::core::tps_engine::TPSEngine;
 use crate::core::types::{
     AgentRuntimeFlags, AgentStatus, BaselineMode, CommittedDetails, EngineError, EventKind,
-    ProcessOutcome, RawSourceSample, UsageSemantics,
+    ProcessOutcome, RawSourceSample, SourceCheckpoint, UsageSemantics,
 };
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -53,7 +53,15 @@ impl EnginePipeline {
                     reconciler.restore_state(
                         l.correlation_key.clone(),
                         l.winning_source.clone(),
+                        l.active_live_token_accuracy,
+                        l.active_live_temporal_accuracy,
                         l.active_live_source_priority,
+                        l.canonical_context_input_total,
+                        l.canonical_fresh_input_total,
+                        l.canonical_output_total,
+                        l.canonical_cache_read,
+                        l.canonical_cache_write,
+                        l.canonical_reasoning,
                     );
                     request_ledger.restore_ledger(l);
                 }
@@ -82,6 +90,16 @@ impl EnginePipeline {
         semantics: &UsageSemantics,
         mode: BaselineMode,
     ) -> Result<ProcessOutcome, EngineError> {
+        self.process_sample_with_checkpoint(sample, semantics, mode, None)
+    }
+
+    pub fn process_sample_with_checkpoint(
+        &mut self,
+        sample: &RawSourceSample,
+        semantics: &UsageSemantics,
+        mode: BaselineMode,
+        checkpoint: Option<&SourceCheckpoint>,
+    ) -> Result<ProcessOutcome, EngineError> {
         let normalized = UsageNormalizer::normalize(&sample.raw_usage, semantics);
         let correlation = RequestCorrelator::correlate(sample);
 
@@ -100,8 +118,9 @@ impl EnginePipeline {
             },
             current_in_tps: None,
             current_out_tps: 0.0,
-            today_tokens: 0,
-            session_tokens: 0,
+            interval_avg_metric: None,
+            today_tokens: None,
+            session_tokens: None,
             token_accuracy: sample.token_accuracy,
             temporal_accuracy: sample.temporal_accuracy,
             last_updated_at_ms: sample.wall_timestamp_ms,
@@ -120,12 +139,12 @@ impl EnginePipeline {
                 None => vec![],
             };
 
-            // P0-11: Final ledger is persisted even if correction is None
+            // P0-11 & P0-5: Final ledger and Checkpoint are persisted in the SAME transaction!
             if let Err(e) = storage_guard.save_canonical_transaction(
                 &[],
                 &corrections_slice,
                 std::slice::from_ref(&updated_ledger),
-                None,
+                checkpoint,
             ) {
                 return Err(EngineError::StorageError(e.to_string()));
             }
@@ -141,6 +160,29 @@ impl EnginePipeline {
                 .calculate(sample, &normalized, &correlation, mode)
         {
             if let Some(canonical_delta) = self.reconciler.reconcile(&raw_delta) {
+                // Freeze Patch Fix 2: Finalized Request MUST NOT produce canonical live delta!
+                let is_finalized = self
+                    .request_ledger
+                    .get_ledger(&canonical_delta.correlation_key)
+                    .map(|l| l.is_finalized)
+                    .unwrap_or(false);
+
+                if is_finalized {
+                    // Consume checkpoint safely (checkpoint-only transaction) without canonical delta
+                    if let Some(cp) = checkpoint {
+                        let mut storage_guard = self.storage.lock();
+                        if let Err(e) =
+                            storage_guard.save_canonical_transaction(&[], &[], &[], Some(cp))
+                        {
+                            return Err(EngineError::StorageError(e.to_string()));
+                        }
+                    }
+
+                    return Ok(ProcessOutcome::Rejected {
+                        reason: "request_finalized_late_event".to_string(),
+                    });
+                }
+
                 self.request_ledger.record_live_delta(&canonical_delta);
                 self.tps_engine.push_delta(&canonical_delta);
 
@@ -153,7 +195,7 @@ impl EnginePipeline {
                         std::slice::from_ref(&canonical_delta),
                         &[],
                         std::slice::from_ref(ledger),
-                        None,
+                        checkpoint,
                     ) {
                         return Err(EngineError::StorageError(e.to_string()));
                     }

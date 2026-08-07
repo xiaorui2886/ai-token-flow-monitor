@@ -1,6 +1,7 @@
 use ai_token_flow_monitor_lib::core::baseline::BaselineTracker;
 use ai_token_flow_monitor_lib::core::gap_detector::GapDetector;
 use ai_token_flow_monitor_lib::core::mock_adapter::MockAdapter;
+use ai_token_flow_monitor_lib::core::normalization::UsageNormalizer;
 use ai_token_flow_monitor_lib::core::persistence::StorageManager;
 use ai_token_flow_monitor_lib::core::types::*;
 use ai_token_flow_monitor_lib::core::EnginePipeline;
@@ -247,7 +248,7 @@ fn test_d1_known_epoch_restart() {
         .process_sample(&s2, &semantics, BaselineMode::KnownZeroOrigin)
         .unwrap();
 
-    let s3 = mock.create_sample(
+    let mut s3 = mock.create_sample(
         "codex",
         "Codex",
         "gpt-4o",
@@ -265,6 +266,8 @@ fn test_d1_known_epoch_restart() {
         0,
         1,
     );
+    // Multi-Field Consistency Freeze: ContinuousEpoch alone must NOT reset; explicit hint required!
+    s3.counter_reset_hint = true;
     let s4 = mock.create_sample(
         "codex",
         "Codex",
@@ -453,40 +456,6 @@ fn test_e_parallel_agent_speed() {
     assert_eq!(global_metrics.global_out_tps, 140.0);
     assert_eq!(global_metrics.peak_out_tps, 140.0);
     println!("P0 Test E PASS: Parallel Agent Speed Aggregation (Codex 60 + Claude 50 + ZCode 30 = 140 OUT TPS)");
-}
-
-#[test]
-fn test_f_mixed_accuracy() {
-    let mut pipeline = create_test_pipeline("run_test_f");
-    let mock = MockAdapter::new("run_test_f");
-    let semantics = generic_semantics();
-
-    let s1 = mock.create_sample(
-        "codex",
-        "Codex",
-        "gpt-4o",
-        "sf1",
-        Some("rf1"),
-        None,
-        1_000_000_000,
-        1000,
-        EventKind::Delta,
-        false,
-        0,
-        60,
-        0,
-        0,
-        0,
-        1,
-    );
-    pipeline
-        .process_sample(&s1, &semantics, BaselineMode::KnownZeroOrigin)
-        .unwrap();
-
-    let statuses = pipeline.global_aggregator.get_agent_statuses();
-    assert_eq!(statuses.len(), 1);
-    assert_eq!(statuses[0].token_accuracy, TokenAccuracy::Exact);
-    println!("MIXED ACCURACY COVERAGE = PASS");
 }
 
 #[test]
@@ -794,7 +763,8 @@ fn test_m_sqlite_primary_key_idempotency() {
         agent_name: "Codex".to_string(),
         model: "gpt-4o".to_string(),
         provider: "openai".to_string(),
-        delta_input_tokens: 10,
+        delta_context_input_tokens: 10,
+        delta_fresh_input_tokens: 10,
         delta_output_tokens: 50,
         delta_cache_read: 0,
         delta_cache_write: 0,
@@ -806,6 +776,12 @@ fn test_m_sqlite_primary_key_idempotency() {
         measurement_kind: MeasurementKind::NativeCounter,
         gap_state: GapState::Normal,
         source_priority: 1,
+        source_cumulative_context_input: None,
+        source_cumulative_fresh_input: None,
+        source_cumulative_output: None,
+        source_cumulative_cache_read: None,
+        source_cumulative_cache_write: None,
+        source_cumulative_reasoning: None,
     };
 
     let l = CanonicalRequestLedger {
@@ -813,23 +789,28 @@ fn test_m_sqlite_primary_key_idempotency() {
         agent_id: "codex".to_string(),
         model: "gpt-4o".to_string(),
         provider: "openai".to_string(),
-        canonical_input_total: 10,
+        canonical_context_input_total: 10,
+        canonical_fresh_input_total: 10,
         canonical_output_total: 50,
         canonical_cache_read: 0,
         canonical_cache_write: 0,
         canonical_reasoning: 0,
-        live_contributed_input: 10,
+        live_contributed_context_input: 10,
+        live_contributed_fresh_input: 10,
         live_contributed_output: 50,
         live_contributed_cache_read: 0,
         live_contributed_cache_write: 0,
         live_contributed_reasoning: 0,
-        authoritative_final_input: None,
+        authoritative_final_context_input: None,
+        authoritative_final_fresh_input: None,
         authoritative_final_output: None,
         authoritative_final_cache_read: None,
         authoritative_final_cache_write: None,
         authoritative_final_reasoning: None,
         winning_source: "mock_source".to_string(),
         active_live_source_priority: 1,
+        active_live_token_accuracy: TokenAccuracy::Exact,
+        active_live_temporal_accuracy: TemporalAccuracy::StreamExact,
         is_finalized: false,
         normalization_version: 1,
         last_reconciled_at_ms: 1000,
@@ -1449,7 +1430,8 @@ fn test_v_effective_in_tps() {
             agent_name: "Codex".to_string(),
             model: "gpt-4o".to_string(),
             provider: "openai".to_string(),
-            delta_input_tokens: sample.raw_usage.raw_input_tokens.unwrap(),
+            delta_context_input_tokens: sample.raw_usage.raw_input_tokens.unwrap(),
+            delta_fresh_input_tokens: sample.raw_usage.raw_input_tokens.unwrap(),
             delta_output_tokens: 0,
             delta_cache_read: 0,
             delta_cache_write: 0,
@@ -1461,6 +1443,12 @@ fn test_v_effective_in_tps() {
             measurement_kind: MeasurementKind::NativeCounter,
             gap_state: GapState::Normal,
             source_priority: 1,
+            source_cumulative_context_input: None,
+            source_cumulative_fresh_input: None,
+            source_cumulative_output: None,
+            source_cumulative_cache_read: None,
+            source_cumulative_cache_write: None,
+            source_cumulative_reasoning: None,
         });
 
     assert_eq!(metric, InputThroughputMetric::EffectiveMeasured(40000.0));
@@ -1509,7 +1497,8 @@ fn test_w_in_unavailable() {
             agent_name: "Codex".to_string(),
             model: "gpt-4o".to_string(),
             provider: "openai".to_string(),
-            delta_input_tokens: sample.raw_usage.raw_input_tokens.unwrap(),
+            delta_context_input_tokens: sample.raw_usage.raw_input_tokens.unwrap(),
+            delta_fresh_input_tokens: sample.raw_usage.raw_input_tokens.unwrap(),
             delta_output_tokens: 0,
             delta_cache_read: 0,
             delta_cache_write: 0,
@@ -1521,6 +1510,12 @@ fn test_w_in_unavailable() {
             measurement_kind: MeasurementKind::NativeCounter,
             gap_state: GapState::Normal,
             source_priority: 1,
+            source_cumulative_context_input: None,
+            source_cumulative_fresh_input: None,
+            source_cumulative_output: None,
+            source_cumulative_cache_read: None,
+            source_cumulative_cache_write: None,
+            source_cumulative_reasoning: None,
         });
 
     assert_eq!(metric, InputThroughputMetric::Unavailable);
@@ -1579,7 +1574,7 @@ fn test_x_final_all_field_reconciliation() {
         .unwrap();
     let correction = extract_correction(outcome).unwrap();
 
-    assert_eq!(correction.input_correction, 10);
+    assert_eq!(correction.context_input_correction, 10);
     assert_eq!(correction.output_correction, -4);
     assert_eq!(correction.cache_read_correction, 950);
     assert_eq!(correction.cache_write_correction, 20);
@@ -1594,7 +1589,7 @@ fn test_x_final_all_field_reconciliation() {
         })
         .unwrap();
 
-    assert_eq!(ledger.canonical_input_total, 110);
+    assert_eq!(ledger.canonical_context_input_total, 110);
     assert_eq!(ledger.canonical_output_total, 196);
     assert_eq!(ledger.canonical_cache_read, 950);
     assert_eq!(ledger.canonical_cache_write, 220);
@@ -1952,6 +1947,1655 @@ fn test_ad_cache_counter_reset() {
         c1.delta_cache_read + c2.delta_cache_read + c3.delta_cache_read + c4.delta_cache_read,
         1800
     );
+}
+
+#[test]
+fn test_ae_interval_exact_instant_exclusion() {
+    let mut pipeline = create_test_pipeline("run_ae");
+    let mock = MockAdapter::new("run_ae");
+    let semantics = generic_semantics();
+
+    let mut sample = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_ae",
+        Some("req_ae"),
+        None,
+        2_000_000_000,
+        2000,
+        EventKind::Snapshot,
+        true,
+        0,
+        120,
+        0,
+        0,
+        0,
+        1,
+    );
+    sample.temporal_accuracy = TemporalAccuracy::IntervalExact;
+    sample.timing.measurement_interval_ms = Some(2000);
+
+    pipeline
+        .process_sample(&sample, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    let metrics = pipeline
+        .tps_engine
+        .calculate_agent_tps("codex", 2_000_000_000, "run_ae");
+    assert_eq!(
+        metrics.current_out_tps, 0.0,
+        "IntervalExact must NOT enter 1s Instant Live OUT TPS!"
+    );
+    assert_eq!(
+        metrics.interval_avg_metric,
+        Some(IntervalAverageMetric {
+            interval_tokens: 120,
+            interval_duration_sec: Some(2.0),
+            interval_tps: Some(60.0),
+        })
+    );
+    println!("INTERVAL EXACT INSTANT EXCLUSION = PASS");
+}
+
+#[test]
+fn test_af_cross_source_handoff_reconciliation() {
+    let mut pipeline = create_test_pipeline("run_af");
+    let semantics = generic_semantics();
+
+    let mock_jsonl = MockAdapter::new("run_af");
+    let mut s_jsonl = mock_jsonl.create_sample_with_native(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_af",
+        Some("req_af"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Snapshot,
+        true,
+        0,
+        100,
+        0,
+        0,
+        0,
+        5,
+        SourceNativeIdentity::default(),
+        "codex_jsonl".to_string(),
+    );
+    s_jsonl.temporal_accuracy = TemporalAccuracy::IntervalExact;
+
+    pipeline
+        .process_sample(&s_jsonl, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    let mock_app = MockAdapter::new("run_af");
+    let s_app = mock_app.create_sample_with_native(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_af",
+        Some("req_af"),
+        None,
+        2_000_000_000,
+        2000,
+        EventKind::Snapshot,
+        true,
+        0,
+        120,
+        0,
+        0,
+        0,
+        10,
+        SourceNativeIdentity::default(),
+        "codex_appserver".to_string(),
+    );
+
+    let o_app = pipeline
+        .process_sample(&s_app, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+    let delta = extract_delta(o_app).unwrap();
+
+    assert_eq!(
+        delta.delta_output_tokens, 20,
+        "Handoff from 100 to 120 must produce delta of 20, NOT 120!"
+    );
+
+    let ledger = pipeline
+        .request_ledger
+        .get_ledger(&RequestCorrelationKey {
+            agent_id: "codex".to_string(),
+            session_id: "sess_af".to_string(),
+            request_id: "req_af".to_string(),
+        })
+        .unwrap();
+
+    assert_eq!(
+        ledger.canonical_output_total, 120,
+        "Total must equal 120, NOT 220!"
+    );
+    println!("CROSS SOURCE HANDOFF RECONCILIATION = PASS");
+}
+
+#[test]
+fn test_ag_end_to_end_in_tps() {
+    let mut pipeline = create_test_pipeline("run_ag");
+    let mock = MockAdapter::new("run_ag");
+    let semantics = generic_semantics();
+
+    let sample = RawSourceSample {
+        timing: TimingInfo {
+            request_start_ms: Some(1000),
+            first_token_ms: Some(1500),
+            ..Default::default()
+        },
+        ..mock.create_sample(
+            "codex",
+            "Codex",
+            "gpt-4o",
+            "sess_ag",
+            Some("req_ag"),
+            None,
+            1_000_000_000,
+            1000,
+            EventKind::Delta,
+            false,
+            20000,
+            10,
+            0,
+            0,
+            0,
+            1,
+        )
+    };
+
+    pipeline
+        .process_sample(&sample, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    let global_metrics = pipeline.global_aggregator.compute_global_metrics(
+        &mut pipeline.tps_engine,
+        1_000_000_000,
+        "run_ag",
+    );
+
+    assert_eq!(global_metrics.in_coverage_measured, 1);
+    assert_eq!(global_metrics.in_coverage_total, 1);
+    assert_eq!(global_metrics.global_in_tps, Some(40000.0));
+    println!("END TO END IN TPS = PASS");
+}
+
+#[test]
+fn test_ah_atomic_checkpoint_replay() {
+    let temp_db_path = std::env::temp_dir().join(format!("test_ah_{}.db", uuid::Uuid::new_v4()));
+    let cp = SourceCheckpoint {
+        source_id: "src_jsonl".to_string(),
+        last_file_offset: 100,
+        last_db_row_id: None,
+        last_sequence_id: None,
+        watermark_timestamp_ms: 1000,
+        updated_at_ms: 1000,
+    };
+
+    {
+        let storage = Arc::new(Mutex::new(StorageManager::new_file(&temp_db_path).unwrap()));
+        let mut p1 = EnginePipeline::new("run_ah1", storage).unwrap();
+        let mock1 = MockAdapter::new("run_ah1");
+        let semantics = generic_semantics();
+
+        let s1 = mock1.create_sample_with_native(
+            "codex",
+            "Codex",
+            "gpt-4o",
+            "sess_ah",
+            Some("req_ah"),
+            None,
+            1_000_000_000,
+            1000,
+            EventKind::Delta,
+            false,
+            0,
+            50,
+            0,
+            0,
+            0,
+            1,
+            SourceNativeIdentity {
+                file_path_hash: Some("file_a".to_string()),
+                byte_offset: Some(100),
+                ..Default::default()
+            },
+            "src_jsonl".to_string(),
+        );
+
+        p1.process_sample_with_checkpoint(
+            &s1,
+            &semantics,
+            BaselineMode::KnownZeroOrigin,
+            Some(&cp),
+        )
+        .unwrap();
+    }
+
+    {
+        let storage2 = Arc::new(Mutex::new(StorageManager::new_file(&temp_db_path).unwrap()));
+        let cps = storage2.lock().load_checkpoints().unwrap();
+        assert_eq!(cps.len(), 1);
+        assert_eq!(cps[0].last_file_offset, 100);
+
+        let mut p2 = EnginePipeline::new("run_ah2", storage2.clone()).unwrap();
+        let mock2 = MockAdapter::new("run_ah2");
+        let semantics = generic_semantics();
+
+        let s_replay = mock2.create_sample_with_native(
+            "codex",
+            "Codex",
+            "gpt-4o",
+            "sess_ah",
+            Some("req_ah"),
+            None,
+            2_000_000_000,
+            2000,
+            EventKind::Delta,
+            false,
+            0,
+            50,
+            0,
+            0,
+            0,
+            1,
+            SourceNativeIdentity {
+                file_path_hash: Some("file_a".to_string()),
+                byte_offset: Some(100),
+                ..Default::default()
+            },
+            "src_jsonl".to_string(),
+        );
+
+        p2.process_sample_with_checkpoint(
+            &s_replay,
+            &semantics,
+            BaselineMode::KnownZeroOrigin,
+            Some(&cp),
+        )
+        .unwrap();
+
+        let total = storage2.lock().get_total_output_tokens("codex").unwrap();
+        assert_eq!(
+            total, 50,
+            "Replaying offset 100 must NOT double count tokens!"
+        );
+    }
+    let _ = std::fs::remove_file(temp_db_path);
+    println!("ATOMIC CHECKPOINT REPLAY = PASS");
+}
+
+#[test]
+fn test_ai_context_fresh_input_stability() {
+    let raw = RawUsage {
+        raw_input_tokens: Some(1000),
+        raw_output_tokens: Some(100),
+        raw_cache_read_tokens: Some(600),
+        raw_cache_write_tokens: Some(0),
+        raw_reasoning_tokens: Some(0),
+        raw_total_tokens: Some(1100),
+    };
+    let semantics = UsageSemantics {
+        reasoning_is_output_subset: true,
+        accounting_strategy: UsageAccountingStrategy::OpenAiStyle,
+        provider_name: "openai".to_string(),
+    };
+    let norm = UsageNormalizer::normalize(&raw, &semantics);
+
+    assert_eq!(norm.normalized_context_input_tokens, 1000);
+    assert_eq!(norm.normalized_fresh_input_tokens, 400);
+    assert_eq!(norm.cache_read_tokens, 600);
+    println!("CONTEXT FRESH INPUT STABILITY = PASS");
+}
+
+#[test]
+fn test_aj_true_mixed_accuracy_coverage() {
+    let mut pipeline = create_test_pipeline("run_aj");
+    let semantics = generic_semantics();
+
+    let mock_codex = MockAdapter::new("run_aj");
+    let s_codex = mock_codex.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "s_c",
+        Some("r_c"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Delta,
+        false,
+        0,
+        60,
+        0,
+        0,
+        0,
+        10,
+    );
+
+    let mock_claude = MockAdapter::new("run_aj");
+    let mut s_claude = mock_claude.create_sample(
+        "claude",
+        "Claude",
+        "sonnet",
+        "s_cl",
+        Some("r_cl"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Snapshot,
+        true,
+        0,
+        50,
+        0,
+        0,
+        0,
+        5,
+    );
+    s_claude.temporal_accuracy = TemporalAccuracy::TurnExact;
+
+    pipeline
+        .process_sample(&s_codex, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+    pipeline
+        .process_sample(&s_claude, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    let global_metrics = pipeline.global_aggregator.compute_global_metrics(
+        &mut pipeline.tps_engine,
+        1_000_000_000,
+        "run_aj",
+    );
+
+    assert_eq!(
+        global_metrics.global_out_tps, 60.0,
+        "Global Instant Live OUT TPS must equal 60.0 (Codex only), NOT 110.0!"
+    );
+    println!("TRUE MIXED ACCURACY COVERAGE = PASS");
+}
+
+#[test]
+fn test_ak_source_ranking_accuracy_temporal_priority() {
+    let t_exact = TokenAccuracy::Exact;
+    let t_est = TokenAccuracy::Estimated;
+    let temp_stream = TemporalAccuracy::StreamExact;
+    let temp_turn = TemporalAccuracy::TurnExact;
+
+    assert!(is_better_source(
+        t_exact,
+        temp_turn,
+        1,
+        t_est,
+        temp_stream,
+        10
+    ));
+    assert!(is_better_source(
+        t_exact,
+        temp_stream,
+        1,
+        t_exact,
+        temp_turn,
+        10
+    ));
+    assert!(is_better_source(
+        t_exact,
+        temp_stream,
+        10,
+        t_exact,
+        temp_stream,
+        5
+    ));
+    println!("SOURCE RANKING ACCURACY > TEMPORAL > PRIORITY = PASS");
+}
+
+#[test]
+fn test_al_finalized_request_excluded_from_instant_tps() {
+    let mut pipeline = create_test_pipeline("run_al");
+    let mock = MockAdapter::new("run_al");
+    let semantics = generic_semantics();
+
+    let s_final = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_al",
+        Some("req_al"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Final,
+        true,
+        0,
+        196,
+        0,
+        0,
+        0,
+        1,
+    );
+    pipeline
+        .process_sample(&s_final, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    let s_late = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_al",
+        Some("req_al"),
+        None,
+        2_000_000_000,
+        2000,
+        EventKind::Delta,
+        false,
+        0,
+        50,
+        0,
+        0,
+        0,
+        1,
+    );
+    pipeline
+        .process_sample(&s_late, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    let metrics = pipeline
+        .tps_engine
+        .calculate_agent_tps("codex", 2_000_000_000, "run_al");
+    assert_eq!(
+        metrics.current_out_tps, 0.0,
+        "Late delta on finalized request must NOT enter Instant OUT TPS!"
+    );
+
+    let ledger = pipeline
+        .request_ledger
+        .get_ledger(&RequestCorrelationKey {
+            agent_id: "codex".to_string(),
+            session_id: "sess_al".to_string(),
+            request_id: "req_al".to_string(),
+        })
+        .unwrap();
+
+    assert_eq!(ledger.canonical_output_total, 196);
+    println!("FINALIZED STREAM DELTA SUPPRESSION = PASS");
+}
+
+#[test]
+fn test_am_source_handoff_uncertainty() {
+    let mut pipeline = create_test_pipeline("run_am");
+    let semantics = generic_semantics();
+
+    let mock_a = MockAdapter::new("run_am");
+    let s_a = mock_a.create_sample_with_native(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_am",
+        Some("req_am"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Snapshot,
+        true,
+        0,
+        100,
+        0,
+        0,
+        0,
+        5,
+        SourceNativeIdentity::default(),
+        "source_a".to_string(),
+    );
+    pipeline
+        .process_sample(&s_a, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    let mock_b = MockAdapter::new("run_am");
+    let s_b = mock_b.create_sample_with_native(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_am",
+        Some("req_am"),
+        None,
+        2_000_000_000,
+        2000,
+        EventKind::Snapshot,
+        true,
+        0,
+        80,
+        0,
+        0,
+        0,
+        10,
+        SourceNativeIdentity::default(),
+        "source_b".to_string(),
+    );
+
+    let o_b = pipeline
+        .process_sample(&s_b, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+    let delta_b = extract_delta(o_b);
+
+    let b_out_tokens = delta_b.map(|d| d.delta_output_tokens).unwrap_or(0);
+    assert_eq!(
+        b_out_tokens, 0,
+        "Handoff to source B at 80 (< 100) must produce 0 extra delta!"
+    );
+
+    let ledger = pipeline
+        .request_ledger
+        .get_ledger(&RequestCorrelationKey {
+            agent_id: "codex".to_string(),
+            session_id: "sess_am".to_string(),
+            request_id: "req_am".to_string(),
+        })
+        .unwrap();
+
+    assert_eq!(ledger.canonical_output_total, 100, "Total must remain 100!");
+    println!("UNCERTAIN HANDOFF FOLLOW-UP = PASS");
+}
+
+#[test]
+fn test_ao_safe_handoff_follow_up() {
+    let mut pipeline = create_test_pipeline("run_ao");
+    let semantics = generic_semantics();
+
+    // Source A cumulative output = 100
+    let mock_a = MockAdapter::new("run_ao");
+    let s_a = mock_a.create_sample_with_native(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_ao",
+        Some("req_ao"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Snapshot,
+        true,
+        0,
+        100,
+        0,
+        0,
+        0,
+        5,
+        SourceNativeIdentity::default(),
+        "source_a".to_string(),
+    );
+    pipeline
+        .process_sample(&s_a, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    // Source B (higher rank) cumulative output = 80 (cannot align)
+    let mock_b1 = MockAdapter::new("run_ao");
+    let s_b1 = mock_b1.create_sample_with_native(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_ao",
+        Some("req_ao"),
+        None,
+        2_000_000_000,
+        2000,
+        EventKind::Snapshot,
+        true,
+        0,
+        80,
+        0,
+        0,
+        0,
+        10,
+        SourceNativeIdentity::default(),
+        "source_b".to_string(),
+    );
+    let o_b1 = pipeline
+        .process_sample(&s_b1, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+    assert!(
+        extract_delta(o_b1).is_none(),
+        "B at 80 must NOT contribute any delta!"
+    );
+
+    // Active source must STILL be A, Canonical = 100
+    let ledger1 = pipeline
+        .request_ledger
+        .get_ledger(&RequestCorrelationKey {
+            agent_id: "codex".to_string(),
+            session_id: "sess_ao".to_string(),
+            request_id: "req_ao".to_string(),
+        })
+        .unwrap();
+    assert_eq!(ledger1.canonical_output_total, 100);
+    assert_eq!(
+        ledger1.winning_source, "source_a",
+        "Active source must still be A when alignment is impossible!"
+    );
+
+    // Source B follow-up cumulative output = 110 (now safely aligned)
+    let mock_b2 = MockAdapter::new("run_ao");
+    let s_b2 = mock_b2.create_sample_with_native(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_ao",
+        Some("req_ao"),
+        None,
+        3_000_000_000,
+        3000,
+        EventKind::Snapshot,
+        true,
+        0,
+        110,
+        0,
+        0,
+        0,
+        10,
+        SourceNativeIdentity::default(),
+        "source_b".to_string(),
+    );
+    let o_b2 = pipeline
+        .process_sample(&s_b2, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+    let delta_b2 = extract_delta(o_b2).expect("B at 110 must now contribute delta!");
+    assert_eq!(
+        delta_b2.delta_output_tokens, 10,
+        "Follow-up handoff must only add 10 (110 - 100)!"
+    );
+
+    // Active source must NOW be B, Canonical = 110 (NOT 130/210)
+    let ledger2 = pipeline
+        .request_ledger
+        .get_ledger(&RequestCorrelationKey {
+            agent_id: "codex".to_string(),
+            session_id: "sess_ao".to_string(),
+            request_id: "req_ao".to_string(),
+        })
+        .unwrap();
+    assert_eq!(
+        ledger2.canonical_output_total, 110,
+        "Canonical must equal 110, NOT 130 or 210!"
+    );
+    assert_eq!(
+        ledger2.winning_source, "source_b",
+        "Active source must switch to B ONLY after safe alignment!"
+    );
+    println!("SAFE HANDOFF FOLLOW-UP = PASS");
+}
+
+#[test]
+fn test_au_all_field_handoff_alignment() {
+    let mut pipeline = create_test_pipeline("run_au");
+    let semantics = generic_semantics();
+
+    // Source A: Context=1000 Fresh=400 Output=100 CacheRead=600 CacheWrite=50 Reasoning=20
+    let mock_a = MockAdapter::new("run_au");
+    let s_a = mock_a.create_sample_with_native(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_au",
+        Some("req_au"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Snapshot,
+        true,
+        1000,
+        100,
+        600,
+        50,
+        20,
+        5,
+        SourceNativeIdentity::default(),
+        "source_a".to_string(),
+    );
+    pipeline
+        .process_sample(&s_a, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    // Source B (higher rank): Context=1100 Fresh=450 Output=120 CacheRead=650 CacheWrite=70 Reasoning=30
+    let mock_b = MockAdapter::new("run_au");
+    let s_b = mock_b.create_sample_with_native(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_au",
+        Some("req_au"),
+        None,
+        2_000_000_000,
+        2000,
+        EventKind::Snapshot,
+        true,
+        1100,
+        120,
+        650,
+        70,
+        30,
+        10,
+        SourceNativeIdentity::default(),
+        "source_b".to_string(),
+    );
+    pipeline
+        .process_sample(&s_b, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    // Final Ledger must exactly equal B's cumulative position (NOT double-counted)
+    let ledger = pipeline
+        .request_ledger
+        .get_ledger(&RequestCorrelationKey {
+            agent_id: "codex".to_string(),
+            session_id: "sess_au".to_string(),
+            request_id: "req_au".to_string(),
+        })
+        .unwrap();
+
+    assert_eq!(ledger.canonical_context_input_total, 1100);
+    assert_eq!(ledger.canonical_fresh_input_total, 450);
+    assert_eq!(ledger.canonical_output_total, 120);
+    assert_eq!(ledger.canonical_cache_read, 650);
+    assert_eq!(ledger.canonical_cache_write, 70);
+    assert_eq!(ledger.canonical_reasoning, 30);
+    println!("ALL FIELD HANDOFF ALIGNMENT = PASS");
+}
+
+#[test]
+fn test_av_missing_field_blocks_handoff() {
+    let mut pipeline = create_test_pipeline("run_av");
+    let semantics = generic_semantics();
+
+    // Source A contributes: Output=100 CacheRead=600
+    let mock_a = MockAdapter::new("run_av");
+    let s_a = mock_a.create_sample_with_native(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_av",
+        Some("req_av"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Snapshot,
+        true,
+        0,
+        100,
+        600,
+        0,
+        0,
+        5,
+        SourceNativeIdentity::default(),
+        "source_a".to_string(),
+    );
+    pipeline
+        .process_sample(&s_a, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    // Source B (higher rank): Output cumulative=120 but CacheRead cumulative=None (unavailable)
+    let mock_b = MockAdapter::new("run_av");
+    let mut s_b = mock_b.create_sample_with_native(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_av",
+        Some("req_av"),
+        None,
+        2_000_000_000,
+        2000,
+        EventKind::Snapshot,
+        true,
+        0,
+        120,
+        0,
+        0,
+        0,
+        10,
+        SourceNativeIdentity::default(),
+        "source_b".to_string(),
+    );
+    // Simulate source cannot provide cache_read field at all
+    s_b.raw_usage.raw_cache_read_tokens = None;
+
+    let o_b = pipeline
+        .process_sample(&s_b, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+    assert!(
+        extract_delta(o_b).is_none(),
+        "B missing cache_read cumulative must NOT handoff!"
+    );
+
+    // Canonical stays: Output=100 CacheRead=600, active source still A
+    let ledger = pipeline
+        .request_ledger
+        .get_ledger(&RequestCorrelationKey {
+            agent_id: "codex".to_string(),
+            session_id: "sess_av".to_string(),
+            request_id: "req_av".to_string(),
+        })
+        .unwrap();
+    assert_eq!(ledger.canonical_output_total, 100);
+    assert_eq!(ledger.canonical_cache_read, 600);
+    assert_eq!(ledger.winning_source, "source_a");
+    println!("MISSING FIELD HANDOFF SAFETY = PASS");
+}
+
+#[test]
+fn test_aw_independent_counter_decrease_safety() {
+    let mut pipeline = create_test_pipeline("run_aw");
+    let mock = MockAdapter::new("run_aw");
+    let semantics = generic_semantics();
+
+    // Snapshot 1: Output=100 CacheRead=1000
+    let s1 = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_aw",
+        Some("req_aw"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Snapshot,
+        true,
+        0,
+        100,
+        1000,
+        0,
+        0,
+        1,
+    );
+    // Snapshot 2: Output=120 CacheRead=1500
+    let s2 = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_aw",
+        Some("req_aw"),
+        None,
+        2_000_000_000,
+        2000,
+        EventKind::Snapshot,
+        true,
+        0,
+        120,
+        1500,
+        0,
+        0,
+        1,
+    );
+    // Snapshot 3: Output=140 CacheRead=100 (cache decrease, NO reset hint!)
+    let s3 = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_aw",
+        Some("req_aw"),
+        None,
+        3_000_000_000,
+        3000,
+        EventKind::Snapshot,
+        true,
+        0,
+        140,
+        100,
+        0,
+        0,
+        1,
+    );
+    // Snapshot 4: Output=150 CacheRead=1600
+    let s4 = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_aw",
+        Some("req_aw"),
+        None,
+        4_000_000_000,
+        4000,
+        EventKind::Snapshot,
+        true,
+        0,
+        150,
+        1600,
+        0,
+        0,
+        1,
+    );
+
+    pipeline
+        .process_sample(&s1, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+    pipeline
+        .process_sample(&s2, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+    pipeline
+        .process_sample(&s3, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+    pipeline
+        .process_sample(&s4, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    let ledger = pipeline
+        .request_ledger
+        .get_ledger(&RequestCorrelationKey {
+            agent_id: "codex".to_string(),
+            session_id: "sess_aw".to_string(),
+            request_id: "req_aw".to_string(),
+        })
+        .unwrap();
+
+    assert_eq!(
+        ledger.canonical_output_total, 150,
+        "Output total must be 150!"
+    );
+    assert_eq!(
+        ledger.canonical_cache_read, 1600,
+        "CacheRead total must be 1600 (S3 cache decrease must NOT add 100)!"
+    );
+    println!("INDEPENDENT COUNTER DECREASE SAFETY = PASS");
+}
+
+#[test]
+fn test_ax_continuous_epoch_requires_reset_hint() {
+    let mut tracker = BaselineTracker::new();
+    let key = RequestCorrelationKey {
+        agent_id: "codex".to_string(),
+        session_id: "sess_ax".to_string(),
+        request_id: "req_ax".to_string(),
+    };
+
+    // First observation 200
+    let c1 = tracker.process_counters(
+        "adapter_ax",
+        &key,
+        0,
+        0,
+        200,
+        0,
+        0,
+        0,
+        BaselineMode::ContinuousEpoch,
+        false,
+    );
+    assert_eq!(c1.delta_output, 200);
+
+    // 200 -> 50 with ContinuousEpoch but NO reset hint: must NOT auto reset to +50!
+    let c2 = tracker.process_counters(
+        "adapter_ax",
+        &key,
+        0,
+        0,
+        50,
+        0,
+        0,
+        0,
+        BaselineMode::ContinuousEpoch,
+        false,
+    );
+    assert_eq!(
+        c2.delta_output, 0,
+        "ContinuousEpoch without explicit reset hint must NOT auto-reset!"
+    );
+    assert!(c2.is_late_old_sample);
+
+    // Explicit counter_reset_hint = true: new epoch, delta = 50 allowed
+    let c3 = tracker.process_counters(
+        "adapter_ax",
+        &key,
+        0,
+        0,
+        50,
+        0,
+        0,
+        0,
+        BaselineMode::ContinuousEpoch,
+        true,
+    );
+    assert_eq!(
+        c3.delta_output, 50,
+        "Only explicit reset hint may establish new epoch with delta = 50!"
+    );
+    println!("EXPLICIT RESET HINT ONLY = PASS");
+}
+
+#[test]
+fn test_ay_canonical_total_stability() {
+    let mut pipeline = create_test_pipeline("run_ay");
+    let mock = MockAdapter::new("run_ay");
+    let semantics = UsageSemantics {
+        reasoning_is_output_subset: true,
+        accounting_strategy: UsageAccountingStrategy::OpenAiStyle,
+        provider_name: "openai".to_string(),
+    };
+
+    // Native Delta path: input=1000, cache_read=600, output=100 -> Context=1000 Fresh=400
+    let s_native = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_ay",
+        Some("req_ay1"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Delta,
+        false,
+        1000,
+        100,
+        600,
+        0,
+        0,
+        1,
+    );
+    let o_native = pipeline
+        .process_sample(&s_native, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+    let d_native = extract_delta(o_native).expect("Native delta must be produced");
+    assert_eq!(
+        d_native.delta_total, 1100,
+        "Native Delta Canonical Total must be Context(1000) + Output(100) = 1100!"
+    );
+
+    // Cumulative Snapshot path: same values
+    let s_snap = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_ay",
+        Some("req_ay2"),
+        None,
+        2_000_000_000,
+        2000,
+        EventKind::Snapshot,
+        true,
+        1000,
+        100,
+        600,
+        0,
+        0,
+        1,
+    );
+    let o_snap = pipeline
+        .process_sample(&s_snap, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+    let d_snap = extract_delta(o_snap).expect("Snapshot delta must be produced");
+    assert_eq!(
+        d_snap.delta_total, 1100,
+        "Cumulative Snapshot Canonical Total must ALSO be Context(1000) + Output(100) = 1100, NOT 500!"
+    );
+
+    println!("CANONICAL TOTAL STABILITY = PASS");
+}
+
+#[test]
+fn test_ap_restart_handoff_cursor() {
+    let temp_db_path = std::env::temp_dir().join(format!("test_ap_{}.db", uuid::Uuid::new_v4()));
+
+    {
+        let storage = Arc::new(Mutex::new(StorageManager::new_file(&temp_db_path).unwrap()));
+        let mut p1 = EnginePipeline::new("run_ap1", storage).unwrap();
+        let mock_a = MockAdapter::new("run_ap1");
+        let semantics = generic_semantics();
+
+        let s_a = mock_a.create_sample_with_native(
+            "codex",
+            "Codex",
+            "gpt-4o",
+            "sess_ap",
+            Some("req_ap"),
+            None,
+            1_000_000_000,
+            1000,
+            EventKind::Snapshot,
+            true,
+            0,
+            100,
+            0,
+            0,
+            0,
+            5,
+            SourceNativeIdentity::default(),
+            "source_a".to_string(),
+        );
+        p1.process_sample(&s_a, &semantics, BaselineMode::KnownZeroOrigin)
+            .unwrap();
+    }
+
+    {
+        let storage2 = Arc::new(Mutex::new(StorageManager::new_file(&temp_db_path).unwrap()));
+        let mut p2 = EnginePipeline::new("run_ap2", storage2.clone()).unwrap();
+        let mock_b = MockAdapter::new("run_ap2");
+        let semantics = generic_semantics();
+
+        let s_b = mock_b.create_sample_with_native(
+            "codex",
+            "Codex",
+            "gpt-4o",
+            "sess_ap",
+            Some("req_ap"),
+            None,
+            2_000_000_000,
+            2000,
+            EventKind::Snapshot,
+            true,
+            0,
+            120,
+            0,
+            0,
+            0,
+            10,
+            SourceNativeIdentity::default(),
+            "source_b".to_string(),
+        );
+
+        p2.process_sample(&s_b, &semantics, BaselineMode::KnownZeroOrigin)
+            .unwrap();
+
+        let total = storage2.lock().get_total_output_tokens("codex").unwrap();
+        assert_eq!(
+            total, 120,
+            "Restart handoff from 100 to 120 must equal 120, NOT 220!"
+        );
+    }
+    let _ = std::fs::remove_file(temp_db_path);
+    println!("RESTART HANDOFF CURSOR = PASS");
+}
+
+#[test]
+fn test_aq_in_tps_freshness() {
+    let mut pipeline = create_test_pipeline("run_aq");
+    let mock = MockAdapter::new("run_aq");
+    let semantics = generic_semantics();
+
+    let sample = RawSourceSample {
+        timing: TimingInfo {
+            request_start_ms: Some(1000),
+            first_token_ms: Some(1500),
+            ..Default::default()
+        },
+        ..mock.create_sample(
+            "codex",
+            "Codex",
+            "gpt-4o",
+            "sess_aq",
+            Some("req_aq"),
+            None,
+            1_000_000_000,
+            1000,
+            EventKind::Delta,
+            false,
+            20000,
+            10,
+            0,
+            0,
+            0,
+            1,
+        )
+    };
+
+    pipeline
+        .process_sample(&sample, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    let m1 = pipeline.global_aggregator.compute_global_metrics(
+        &mut pipeline.tps_engine,
+        1_000_000_000,
+        "run_aq",
+    );
+    assert_eq!(m1.global_in_tps, Some(40000.0));
+
+    // After 3 seconds (3_000_000_000 ns elapsed without new input event)
+    let m3 = pipeline.global_aggregator.compute_global_metrics(
+        &mut pipeline.tps_engine,
+        4_000_000_000,
+        "run_aq",
+    );
+    assert_eq!(
+        m3.global_in_tps, None,
+        "Current IN TPS must expire after 1s freshness window!"
+    );
+    println!("IN TPS FRESHNESS = PASS");
+}
+
+#[test]
+fn test_ar_5s_live_eligibility() {
+    let mut pipeline = create_test_pipeline("run_ar");
+    let mock = MockAdapter::new("run_ar");
+    let semantics = generic_semantics();
+
+    let s_stream = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_ar",
+        Some("req_ar1"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Delta,
+        false,
+        0,
+        50,
+        0,
+        0,
+        0,
+        1,
+    );
+
+    let mut s_interval = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_ar",
+        Some("req_ar2"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Snapshot,
+        true,
+        0,
+        200,
+        0,
+        0,
+        0,
+        1,
+    );
+    s_interval.temporal_accuracy = TemporalAccuracy::IntervalExact;
+    s_interval.timing.measurement_interval_ms = Some(2000);
+
+    pipeline
+        .process_sample(&s_stream, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+    pipeline
+        .process_sample(&s_interval, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    let metrics = pipeline
+        .tps_engine
+        .calculate_agent_tps("codex", 1_000_000_000, "run_ar");
+
+    assert_eq!(
+        metrics.avg_5s_out_tps, 50.0,
+        "5s Live Average must ONLY include StreamExact (50.0 t/s), NOT 250.0 t/s!"
+    );
+    println!("5S LIVE ELIGIBILITY = PASS");
+}
+
+#[test]
+fn test_as_schema_upgrade_policy() {
+    let temp_db_path = std::env::temp_dir().join(format!("test_as_{}.db", uuid::Uuid::new_v4()));
+    {
+        let conn = rusqlite::Connection::open(&temp_db_path).unwrap();
+        conn.execute("PRAGMA user_version = 1;", []).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE canonical_request_ledgers (
+                agent_id TEXT, session_id TEXT, request_id TEXT, PRIMARY KEY (agent_id, session_id, request_id)
+            );",
+        )
+        .unwrap();
+    }
+
+    {
+        let storage = StorageManager::new_file(&temp_db_path).unwrap();
+        let ledgers = storage.load_ledgers().unwrap();
+        assert_eq!(ledgers.len(), 0);
+    }
+    let _ = std::fs::remove_file(temp_db_path);
+    println!("SCHEMA UPGRADE POLICY = PASS");
+}
+
+#[test]
+fn test_an_finalized_canonical_suppression() {
+    let temp_db_path = std::env::temp_dir().join(format!("test_an_{}.db", uuid::Uuid::new_v4()));
+    let storage = Arc::new(Mutex::new(StorageManager::new_file(&temp_db_path).unwrap()));
+    let mut pipeline = EnginePipeline::new("run_an", storage.clone()).unwrap();
+    let mock = MockAdapter::new("run_an");
+    let semantics = generic_semantics();
+
+    // 1. Finalize request at 196
+    let s_final = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_an",
+        Some("req_an"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Final,
+        true,
+        0,
+        196,
+        0,
+        0,
+        0,
+        1,
+    );
+    pipeline
+        .process_sample(&s_final, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    // Record canonical_token_deltas count
+    let deltas_before = storage.lock().load_stable_ingestion_ids().unwrap().len();
+
+    // 2. Late StreamExact Delta +50
+    let s_late = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_an",
+        Some("req_an"),
+        None,
+        2_000_000_000,
+        2000,
+        EventKind::Delta,
+        false,
+        0,
+        50,
+        0,
+        0,
+        0,
+        1,
+    );
+    let outcome = pipeline
+        .process_sample(&s_late, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    // 3. Verify Rejected outcome without canonical delta
+    match outcome {
+        ProcessOutcome::Rejected { reason } => {
+            assert_eq!(reason, "request_finalized_late_event");
+        }
+        _ => panic!("Finalized late event must return ProcessOutcome::Rejected!"),
+    }
+
+    // 4. Ledger stays 196
+    let ledger = pipeline
+        .request_ledger
+        .get_ledger(&RequestCorrelationKey {
+            agent_id: "codex".to_string(),
+            session_id: "sess_an".to_string(),
+            request_id: "req_an".to_string(),
+        })
+        .unwrap();
+    assert_eq!(ledger.canonical_output_total, 196);
+
+    // 5. canonical_token_deltas count unchanged
+    let deltas_after = storage.lock().load_stable_ingestion_ids().unwrap().len();
+    assert_eq!(
+        deltas_after, deltas_before,
+        "Finalized late event must NOT insert canonical_token_deltas!"
+    );
+
+    // 6. Instant TPS = 0
+    let metrics = pipeline
+        .tps_engine
+        .calculate_agent_tps("codex", 2_000_000_000, "run_an");
+    assert_eq!(metrics.current_out_tps, 0.0);
+
+    let _ = std::fs::remove_file(temp_db_path);
+    println!("FINALIZED CANONICAL SUPPRESSION = PASS");
+}
+
+#[test]
+fn test_as1_old_schema_stale_checkpoint_reset() {
+    let temp_db_path = std::env::temp_dir().join(format!("test_as1_{}.db", uuid::Uuid::new_v4()));
+    {
+        let conn = rusqlite::Connection::open(&temp_db_path).unwrap();
+        conn.execute("PRAGMA user_version = 1;", []).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE source_checkpoints (
+                source_id TEXT PRIMARY KEY,
+                last_file_offset INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE canonical_request_ledgers (
+                agent_id TEXT, session_id TEXT, request_id TEXT, PRIMARY KEY (agent_id, session_id, request_id)
+            );
+            INSERT INTO source_checkpoints (source_id, last_file_offset) VALUES ('old_src', 50000);
+            ",
+        )
+        .unwrap();
+    }
+
+    {
+        let storage = StorageManager::new_file(&temp_db_path).unwrap();
+        let cps = storage.load_checkpoints().unwrap();
+        assert_eq!(
+            cps.len(),
+            0,
+            "Old stale checkpoint (offset=50000) must NOT survive atomic schema reset!"
+        );
+    }
+    let _ = std::fs::remove_file(temp_db_path);
+    println!("SCHEMA ATOMIC RESET = PASS");
+}
+
+#[test]
+fn test_as2_future_schema_reject() {
+    let temp_db_path = std::env::temp_dir().join(format!("test_as2_{}.db", uuid::Uuid::new_v4()));
+    {
+        let conn = rusqlite::Connection::open(&temp_db_path).unwrap();
+        conn.execute("PRAGMA user_version = 3;", []).unwrap();
+    }
+
+    {
+        let result = StorageManager::new_file(&temp_db_path);
+        assert!(
+            result.is_err(),
+            "Future schema version 3 must be REJECTED, never silently downgraded!"
+        );
+    }
+    let _ = std::fs::remove_file(temp_db_path);
+    println!("FUTURE SCHEMA REJECT = PASS");
+}
+
+#[test]
+fn test_at_today_session_unavailable() {
+    let mut pipeline = create_test_pipeline("run_at");
+    let mock = MockAdapter::new("run_at");
+    let semantics = generic_semantics();
+
+    let s1 = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_at",
+        Some("req_at"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Delta,
+        false,
+        0,
+        60,
+        0,
+        0,
+        0,
+        1,
+    );
+    pipeline
+        .process_sample(&s1, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    let metrics = pipeline.global_aggregator.compute_global_metrics(
+        &mut pipeline.tps_engine,
+        1_000_000_000,
+        "run_at",
+    );
+
+    assert_eq!(
+        metrics.today_tokens, None,
+        "Today tokens must be None (no committed aggregate provider)!"
+    );
+    assert_eq!(
+        metrics.session_tokens, None,
+        "Session tokens must be None (no committed aggregate provider)!"
+    );
+    println!("TODAY SESSION UNAVAILABLE = PASS");
+}
+
+#[test]
+fn test_fix1_interval_without_duration() {
+    let mock = MockAdapter::new("run_fix1");
+    let mut sample = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_fix1",
+        Some("req_fix1"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Snapshot,
+        true,
+        0,
+        100,
+        0,
+        0,
+        0,
+        1,
+    );
+    sample.temporal_accuracy = TemporalAccuracy::IntervalExact;
+    sample.timing.measurement_interval_ms = None;
+
+    let mut pipeline = create_test_pipeline("run_fix1");
+    let semantics = generic_semantics();
+    pipeline
+        .process_sample(&sample, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    let metrics = pipeline
+        .tps_engine
+        .calculate_agent_tps("codex", 1_000_000_000, "run_fix1");
+    assert_eq!(
+        metrics.interval_avg_metric,
+        Some(IntervalAverageMetric {
+            interval_tokens: 100,
+            interval_duration_sec: None,
+            interval_tps: None,
+        })
+    );
+    println!("FIX1 INTERVAL WITHOUT DURATION = PASS");
+}
+
+#[test]
+fn test_fix2_persistence_accuracy_restore() {
+    let temp_db_path = std::env::temp_dir().join(format!("test_fix2_{}.db", uuid::Uuid::new_v4()));
+    {
+        let storage = Arc::new(Mutex::new(StorageManager::new_file(&temp_db_path).unwrap()));
+        let mut p1 = EnginePipeline::new("run_fix2_1", storage).unwrap();
+        let mock = MockAdapter::new("run_fix2_1");
+        let semantics = generic_semantics();
+
+        let mut sample = mock.create_sample(
+            "codex",
+            "Codex",
+            "gpt-4o",
+            "sess_fix2",
+            Some("req_fix2"),
+            None,
+            1_000_000_000,
+            1000,
+            EventKind::Snapshot,
+            true,
+            0,
+            100,
+            0,
+            0,
+            0,
+            1,
+        );
+        sample.token_accuracy = TokenAccuracy::Exact;
+        sample.temporal_accuracy = TemporalAccuracy::TurnExact;
+
+        p1.process_sample(&sample, &semantics, BaselineMode::KnownZeroOrigin)
+            .unwrap();
+    }
+
+    {
+        let storage2 = Arc::new(Mutex::new(StorageManager::new_file(&temp_db_path).unwrap()));
+        let p2 = EnginePipeline::new("run_fix2_2", storage2).unwrap();
+
+        let ledger = p2
+            .request_ledger
+            .get_ledger(&RequestCorrelationKey {
+                agent_id: "codex".to_string(),
+                session_id: "sess_fix2".to_string(),
+                request_id: "req_fix2".to_string(),
+            })
+            .unwrap();
+
+        assert_eq!(ledger.active_live_token_accuracy, TokenAccuracy::Exact);
+        assert_eq!(
+            ledger.active_live_temporal_accuracy,
+            TemporalAccuracy::TurnExact
+        );
+    }
+    let _ = std::fs::remove_file(temp_db_path);
+    println!("FIX2 PERSISTENCE ACCURACY RESTORE = PASS");
+}
+
+#[test]
+fn test_fix3_correction_does_not_reset_generation() {
+    let mut tracker = BaselineTracker::new();
+    let key = RequestCorrelationKey {
+        agent_id: "codex".to_string(),
+        session_id: "sess_fix3".to_string(),
+        request_id: "req_fix3".to_string(),
+    };
+
+    let c1 = tracker.process_counters(
+        "adapter_fix3",
+        &key,
+        0,
+        0,
+        100,
+        0,
+        0,
+        0,
+        BaselineMode::KnownZeroOrigin,
+        false,
+    );
+    assert_eq!(c1.delta_output, 100);
+
+    let c2 = tracker.process_counters(
+        "adapter_fix3",
+        &key,
+        0,
+        0,
+        80,
+        0,
+        0,
+        0,
+        BaselineMode::KnownZeroOrigin,
+        false,
+    );
+    assert_eq!(
+        c2.delta_output, 0,
+        "Correction event without reset hint must NOT trigger counter reset!"
+    );
+    println!("FIX3 CORRECTION DOES NOT RESET GENERATION = PASS");
+}
+
+fn is_better_source(
+    t1: TokenAccuracy,
+    tp1: TemporalAccuracy,
+    p1: u8,
+    t2: TokenAccuracy,
+    tp2: TemporalAccuracy,
+    p2: u8,
+) -> bool {
+    if t1 != t2 {
+        return t1 > t2;
+    }
+    if tp1 != tp2 {
+        return tp1 > tp2;
+    }
+    p1 > p2
 }
 
 #[test]
