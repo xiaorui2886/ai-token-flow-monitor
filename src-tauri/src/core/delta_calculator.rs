@@ -53,7 +53,8 @@ impl DeltaCalculator {
         );
 
         // Skip producing empty deltas
-        if acc_delta.delta_input == 0
+        if acc_delta.delta_context_input == 0
+            && acc_delta.delta_fresh_input == 0
             && acc_delta.delta_output == 0
             && acc_delta.delta_cache_read == 0
             && acc_delta.delta_cache_write == 0
@@ -77,7 +78,8 @@ impl DeltaCalculator {
             agent_name: sample.agent_name.clone(),
             model: sample.model.clone(),
             provider: sample.provider.clone(),
-            delta_input_tokens: acc_delta.delta_input,
+            delta_context_input_tokens: acc_delta.delta_context_input,
+            delta_fresh_input_tokens: acc_delta.delta_fresh_input,
             delta_output_tokens: acc_delta.delta_output,
             delta_cache_read: acc_delta.delta_cache_read,
             delta_cache_write: acc_delta.delta_cache_write,

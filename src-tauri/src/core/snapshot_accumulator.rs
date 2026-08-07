@@ -4,7 +4,8 @@ use crate::core::types::{
 };
 
 pub struct AccumulatedDelta {
-    pub delta_input: u64,
+    pub delta_context_input: u64,
+    pub delta_fresh_input: u64,
     pub delta_output: u64,
     pub delta_cache_read: u64,
     pub delta_cache_write: u64,
@@ -41,7 +42,8 @@ impl SnapshotAccumulator {
         if sample.event_kind == EventKind::Delta {
             // Native delta mode
             return AccumulatedDelta {
-                delta_input: normalized.normalized_fresh_input_tokens,
+                delta_context_input: normalized.normalized_context_input_tokens,
+                delta_fresh_input: normalized.normalized_fresh_input_tokens,
                 delta_output: normalized.normalized_output_tokens,
                 delta_cache_read: normalized.cache_read_tokens,
                 delta_cache_write: normalized.cache_write_tokens,
@@ -53,7 +55,10 @@ impl SnapshotAccumulator {
         }
 
         // Cumulative snapshot mode across ALL counters (P0-1)
-        let is_explicit_reset = sample.event_kind == EventKind::Correction;
+        // P1-3: Use explicit counter_reset_hint or EventKind::Correction
+        let is_explicit_reset =
+            sample.counter_reset_hint || sample.event_kind == EventKind::Correction;
+
         let c_deltas = self.tracker.process_counters(
             &sample.source_adapter_id,
             key,
@@ -70,7 +75,8 @@ impl SnapshotAccumulator {
         let d_total = c_deltas.delta_fresh_input + c_deltas.delta_output;
 
         AccumulatedDelta {
-            delta_input: c_deltas.delta_fresh_input,
+            delta_context_input: c_deltas.delta_context_input,
+            delta_fresh_input: c_deltas.delta_fresh_input,
             delta_output: c_deltas.delta_output,
             delta_cache_read: c_deltas.delta_cache_read,
             delta_cache_write: c_deltas.delta_cache_write,

@@ -57,6 +57,7 @@ impl GlobalAggregator {
                 tps_engine.calculate_agent_tps(agent_id, current_monotonic_ns, current_run_id);
             status.current_out_tps = metrics.current_out_tps;
             status.current_in_tps = metrics.current_in_tps;
+            status.interval_avg_metric = metrics.interval_avg_metric;
 
             status.flags.generating = metrics.current_out_tps > 0.0;
             if status.flags.generating {

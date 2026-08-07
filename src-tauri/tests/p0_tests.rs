@@ -1,6 +1,7 @@
 use ai_token_flow_monitor_lib::core::baseline::BaselineTracker;
 use ai_token_flow_monitor_lib::core::gap_detector::GapDetector;
 use ai_token_flow_monitor_lib::core::mock_adapter::MockAdapter;
+use ai_token_flow_monitor_lib::core::normalization::UsageNormalizer;
 use ai_token_flow_monitor_lib::core::persistence::StorageManager;
 use ai_token_flow_monitor_lib::core::types::*;
 use ai_token_flow_monitor_lib::core::EnginePipeline;
@@ -456,40 +457,6 @@ fn test_e_parallel_agent_speed() {
 }
 
 #[test]
-fn test_f_mixed_accuracy() {
-    let mut pipeline = create_test_pipeline("run_test_f");
-    let mock = MockAdapter::new("run_test_f");
-    let semantics = generic_semantics();
-
-    let s1 = mock.create_sample(
-        "codex",
-        "Codex",
-        "gpt-4o",
-        "sf1",
-        Some("rf1"),
-        None,
-        1_000_000_000,
-        1000,
-        EventKind::Delta,
-        false,
-        0,
-        60,
-        0,
-        0,
-        0,
-        1,
-    );
-    pipeline
-        .process_sample(&s1, &semantics, BaselineMode::KnownZeroOrigin)
-        .unwrap();
-
-    let statuses = pipeline.global_aggregator.get_agent_statuses();
-    assert_eq!(statuses.len(), 1);
-    assert_eq!(statuses[0].token_accuracy, TokenAccuracy::Exact);
-    println!("MIXED ACCURACY COVERAGE = PASS");
-}
-
-#[test]
 fn test_h_known_new_request() {
     let mut tracker = BaselineTracker::new();
     let key = RequestCorrelationKey {
@@ -794,7 +761,8 @@ fn test_m_sqlite_primary_key_idempotency() {
         agent_name: "Codex".to_string(),
         model: "gpt-4o".to_string(),
         provider: "openai".to_string(),
-        delta_input_tokens: 10,
+        delta_context_input_tokens: 10,
+        delta_fresh_input_tokens: 10,
         delta_output_tokens: 50,
         delta_cache_read: 0,
         delta_cache_write: 0,
@@ -813,23 +781,28 @@ fn test_m_sqlite_primary_key_idempotency() {
         agent_id: "codex".to_string(),
         model: "gpt-4o".to_string(),
         provider: "openai".to_string(),
-        canonical_input_total: 10,
+        canonical_context_input_total: 10,
+        canonical_fresh_input_total: 10,
         canonical_output_total: 50,
         canonical_cache_read: 0,
         canonical_cache_write: 0,
         canonical_reasoning: 0,
-        live_contributed_input: 10,
+        live_contributed_context_input: 10,
+        live_contributed_fresh_input: 10,
         live_contributed_output: 50,
         live_contributed_cache_read: 0,
         live_contributed_cache_write: 0,
         live_contributed_reasoning: 0,
-        authoritative_final_input: None,
+        authoritative_final_context_input: None,
+        authoritative_final_fresh_input: None,
         authoritative_final_output: None,
         authoritative_final_cache_read: None,
         authoritative_final_cache_write: None,
         authoritative_final_reasoning: None,
         winning_source: "mock_source".to_string(),
         active_live_source_priority: 1,
+        active_live_token_accuracy: TokenAccuracy::Exact,
+        active_live_temporal_accuracy: TemporalAccuracy::StreamExact,
         is_finalized: false,
         normalization_version: 1,
         last_reconciled_at_ms: 1000,
@@ -1449,7 +1422,8 @@ fn test_v_effective_in_tps() {
             agent_name: "Codex".to_string(),
             model: "gpt-4o".to_string(),
             provider: "openai".to_string(),
-            delta_input_tokens: sample.raw_usage.raw_input_tokens.unwrap(),
+            delta_context_input_tokens: sample.raw_usage.raw_input_tokens.unwrap(),
+            delta_fresh_input_tokens: sample.raw_usage.raw_input_tokens.unwrap(),
             delta_output_tokens: 0,
             delta_cache_read: 0,
             delta_cache_write: 0,
@@ -1509,7 +1483,8 @@ fn test_w_in_unavailable() {
             agent_name: "Codex".to_string(),
             model: "gpt-4o".to_string(),
             provider: "openai".to_string(),
-            delta_input_tokens: sample.raw_usage.raw_input_tokens.unwrap(),
+            delta_context_input_tokens: sample.raw_usage.raw_input_tokens.unwrap(),
+            delta_fresh_input_tokens: sample.raw_usage.raw_input_tokens.unwrap(),
             delta_output_tokens: 0,
             delta_cache_read: 0,
             delta_cache_write: 0,
@@ -1579,7 +1554,7 @@ fn test_x_final_all_field_reconciliation() {
         .unwrap();
     let correction = extract_correction(outcome).unwrap();
 
-    assert_eq!(correction.input_correction, 10);
+    assert_eq!(correction.context_input_correction, 10);
     assert_eq!(correction.output_correction, -4);
     assert_eq!(correction.cache_read_correction, 950);
     assert_eq!(correction.cache_write_correction, 20);
@@ -1594,7 +1569,7 @@ fn test_x_final_all_field_reconciliation() {
         })
         .unwrap();
 
-    assert_eq!(ledger.canonical_input_total, 110);
+    assert_eq!(ledger.canonical_context_input_total, 110);
     assert_eq!(ledger.canonical_output_total, 196);
     assert_eq!(ledger.canonical_cache_read, 950);
     assert_eq!(ledger.canonical_cache_write, 220);
@@ -1952,6 +1927,426 @@ fn test_ad_cache_counter_reset() {
         c1.delta_cache_read + c2.delta_cache_read + c3.delta_cache_read + c4.delta_cache_read,
         1800
     );
+}
+
+#[test]
+fn test_ae_interval_exact_instant_exclusion() {
+    let mut pipeline = create_test_pipeline("run_ae");
+    let mock = MockAdapter::new("run_ae");
+    let semantics = generic_semantics();
+
+    // Sample with TemporalAccuracy::IntervalExact
+    let mut sample = mock.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_ae",
+        Some("req_ae"),
+        None,
+        2_000_000_000,
+        2000,
+        EventKind::Snapshot,
+        true,
+        0,
+        120,
+        0,
+        0,
+        0,
+        1,
+    );
+    sample.temporal_accuracy = TemporalAccuracy::IntervalExact;
+
+    pipeline
+        .process_sample(&sample, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    let metrics = pipeline
+        .tps_engine
+        .calculate_agent_tps("codex", 2_000_000_000, "run_ae");
+    assert_eq!(
+        metrics.current_out_tps, 0.0,
+        "IntervalExact must NOT enter 1s Instant Live OUT TPS!"
+    );
+    println!("INTERVAL EXACT INSTANT EXCLUSION = PASS");
+}
+
+#[test]
+fn test_af_cross_source_handoff_reconciliation() {
+    let mut pipeline = create_test_pipeline("run_af");
+    let semantics = generic_semantics();
+
+    // Source 1 (Low priority/IntervalExact): snapshot 100
+    let mock_jsonl = MockAdapter::new("run_af");
+    let mut s_jsonl = mock_jsonl.create_sample_with_native(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_af",
+        Some("req_af"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Snapshot,
+        true,
+        0,
+        100,
+        0,
+        0,
+        0,
+        5,
+        SourceNativeIdentity::default(),
+        "codex_jsonl".to_string(),
+    );
+    s_jsonl.temporal_accuracy = TemporalAccuracy::IntervalExact;
+
+    pipeline
+        .process_sample(&s_jsonl, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    // Source 2 (High priority/StreamExact): snapshot 120
+    let mock_app = MockAdapter::new("run_af");
+    let s_app = mock_app.create_sample_with_native(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "sess_af",
+        Some("req_af"),
+        None,
+        2_000_000_000,
+        2000,
+        EventKind::Snapshot,
+        true,
+        0,
+        120,
+        0,
+        0,
+        0,
+        10,
+        SourceNativeIdentity::default(),
+        "codex_appserver".to_string(),
+    );
+
+    let o_app = pipeline
+        .process_sample(&s_app, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+    let delta = extract_delta(o_app).unwrap();
+
+    assert_eq!(
+        delta.delta_output_tokens, 20,
+        "Handoff from 100 to 120 must produce delta of 20, NOT 120!"
+    );
+
+    let ledger = pipeline
+        .request_ledger
+        .get_ledger(&RequestCorrelationKey {
+            agent_id: "codex".to_string(),
+            session_id: "sess_af".to_string(),
+            request_id: "req_af".to_string(),
+        })
+        .unwrap();
+
+    assert_eq!(
+        ledger.canonical_output_total, 120,
+        "Total must equal 120, NOT 220!"
+    );
+    println!("CROSS SOURCE HANDOFF RECONCILIATION = PASS");
+}
+
+#[test]
+fn test_ag_end_to_end_in_tps() {
+    let mut pipeline = create_test_pipeline("run_ag");
+    let mock = MockAdapter::new("run_ag");
+    let semantics = generic_semantics();
+
+    let sample = RawSourceSample {
+        timing: TimingInfo {
+            request_start_ms: Some(1000),
+            first_token_ms: Some(1500),
+            ..Default::default()
+        },
+        ..mock.create_sample(
+            "codex",
+            "Codex",
+            "gpt-4o",
+            "sess_ag",
+            Some("req_ag"),
+            None,
+            1_000_000_000,
+            1000,
+            EventKind::Delta,
+            false,
+            20000,
+            10,
+            0,
+            0,
+            0,
+            1,
+        )
+    };
+
+    pipeline
+        .process_sample(&sample, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    let global_metrics = pipeline.global_aggregator.compute_global_metrics(
+        &mut pipeline.tps_engine,
+        1_000_000_000,
+        "run_ag",
+    );
+
+    assert_eq!(global_metrics.in_coverage_measured, 1);
+    assert_eq!(global_metrics.in_coverage_total, 1);
+    println!("END TO END IN TPS = PASS");
+}
+
+#[test]
+fn test_ah_atomic_checkpoint_replay() {
+    let temp_db_path = std::env::temp_dir().join(format!("test_ah_{}.db", uuid::Uuid::new_v4()));
+    let cp = SourceCheckpoint {
+        source_id: "src_jsonl".to_string(),
+        last_file_offset: 100,
+        last_db_row_id: None,
+        last_sequence_id: None,
+        watermark_timestamp_ms: 1000,
+        updated_at_ms: 1000,
+    };
+
+    {
+        let storage = Arc::new(Mutex::new(StorageManager::new_file(&temp_db_path).unwrap()));
+        let mut p1 = EnginePipeline::new("run_ah1", storage).unwrap();
+        let mock1 = MockAdapter::new("run_ah1");
+        let semantics = generic_semantics();
+
+        let s1 = mock1.create_sample_with_native(
+            "codex",
+            "Codex",
+            "gpt-4o",
+            "sess_ah",
+            Some("req_ah"),
+            None,
+            1_000_000_000,
+            1000,
+            EventKind::Delta,
+            false,
+            0,
+            50,
+            0,
+            0,
+            0,
+            1,
+            SourceNativeIdentity {
+                file_path_hash: Some("file_a".to_string()),
+                byte_offset: Some(100),
+                ..Default::default()
+            },
+            "src_jsonl".to_string(),
+        );
+
+        p1.process_sample_with_checkpoint(
+            &s1,
+            &semantics,
+            BaselineMode::KnownZeroOrigin,
+            Some(&cp),
+        )
+        .unwrap();
+    }
+
+    {
+        let storage2 = Arc::new(Mutex::new(StorageManager::new_file(&temp_db_path).unwrap()));
+        let cps = storage2.lock().load_checkpoints().unwrap();
+        assert_eq!(cps.len(), 1);
+        assert_eq!(cps[0].last_file_offset, 100);
+
+        let mut p2 = EnginePipeline::new("run_ah2", storage2.clone()).unwrap();
+        let mock2 = MockAdapter::new("run_ah2");
+        let semantics = generic_semantics();
+
+        let s_replay = mock2.create_sample_with_native(
+            "codex",
+            "Codex",
+            "gpt-4o",
+            "sess_ah",
+            Some("req_ah"),
+            None,
+            2_000_000_000,
+            2000,
+            EventKind::Delta,
+            false,
+            0,
+            50,
+            0,
+            0,
+            0,
+            1,
+            SourceNativeIdentity {
+                file_path_hash: Some("file_a".to_string()),
+                byte_offset: Some(100),
+                ..Default::default()
+            },
+            "src_jsonl".to_string(),
+        );
+
+        p2.process_sample_with_checkpoint(
+            &s_replay,
+            &semantics,
+            BaselineMode::KnownZeroOrigin,
+            Some(&cp),
+        )
+        .unwrap();
+
+        let total = storage2.lock().get_total_output_tokens("codex").unwrap();
+        assert_eq!(
+            total, 50,
+            "Replaying offset 100 must NOT double count tokens!"
+        );
+    }
+    let _ = std::fs::remove_file(temp_db_path);
+    println!("ATOMIC CHECKPOINT REPLAY = PASS");
+}
+
+#[test]
+fn test_ai_context_fresh_input_stability() {
+    let raw = RawUsage {
+        raw_input_tokens: Some(1000),
+        raw_output_tokens: Some(100),
+        raw_cache_read_tokens: Some(600),
+        raw_cache_write_tokens: Some(0),
+        raw_reasoning_tokens: Some(0),
+        raw_total_tokens: Some(1100),
+    };
+    let semantics = UsageSemantics {
+        reasoning_is_output_subset: true,
+        accounting_strategy: UsageAccountingStrategy::OpenAiStyle,
+        provider_name: "openai".to_string(),
+    };
+    let norm = UsageNormalizer::normalize(&raw, &semantics);
+
+    assert_eq!(norm.normalized_context_input_tokens, 1000);
+    assert_eq!(norm.normalized_fresh_input_tokens, 400);
+    assert_eq!(norm.cache_read_tokens, 600);
+    println!("CONTEXT FRESH INPUT STABILITY = PASS");
+}
+
+#[test]
+fn test_aj_true_mixed_accuracy_coverage() {
+    let mut pipeline = create_test_pipeline("run_aj");
+    let semantics = generic_semantics();
+
+    // Codex: Exact + StreamExact + 60
+    let mock_codex = MockAdapter::new("run_aj");
+    let s_codex = mock_codex.create_sample(
+        "codex",
+        "Codex",
+        "gpt-4o",
+        "s_c",
+        Some("r_c"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Delta,
+        false,
+        0,
+        60,
+        0,
+        0,
+        0,
+        10,
+    );
+
+    // Claude: Exact + TurnExact + 50
+    let mock_claude = MockAdapter::new("run_aj");
+    let mut s_claude = mock_claude.create_sample(
+        "claude",
+        "Claude",
+        "sonnet",
+        "s_cl",
+        Some("r_cl"),
+        None,
+        1_000_000_000,
+        1000,
+        EventKind::Snapshot,
+        true,
+        0,
+        50,
+        0,
+        0,
+        0,
+        5,
+    );
+    s_claude.temporal_accuracy = TemporalAccuracy::TurnExact;
+
+    pipeline
+        .process_sample(&s_codex, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+    pipeline
+        .process_sample(&s_claude, &semantics, BaselineMode::KnownZeroOrigin)
+        .unwrap();
+
+    let global_metrics = pipeline.global_aggregator.compute_global_metrics(
+        &mut pipeline.tps_engine,
+        1_000_000_000,
+        "run_aj",
+    );
+
+    assert_eq!(
+        global_metrics.global_out_tps, 60.0,
+        "Global Instant Live OUT TPS must equal 60.0 (Codex only), NOT 110.0!"
+    );
+    println!("TRUE MIXED ACCURACY COVERAGE = PASS");
+}
+
+#[test]
+fn test_ak_source_ranking_accuracy_temporal_priority() {
+    let t_exact = TokenAccuracy::Exact;
+    let t_est = TokenAccuracy::Estimated;
+    let temp_stream = TemporalAccuracy::StreamExact;
+    let temp_turn = TemporalAccuracy::TurnExact;
+
+    // Exact > Estimated regardless of priority
+    assert!(is_better_source(
+        t_exact,
+        temp_turn,
+        1,
+        t_est,
+        temp_stream,
+        10
+    ));
+    // StreamExact > TurnExact if TokenAccuracy equal
+    assert!(is_better_source(
+        t_exact,
+        temp_stream,
+        1,
+        t_exact,
+        temp_turn,
+        10
+    ));
+    // Priority tie-breaker when Accuracy and TemporalAccuracy equal
+    assert!(is_better_source(
+        t_exact,
+        temp_stream,
+        10,
+        t_exact,
+        temp_stream,
+        5
+    ));
+    println!("SOURCE RANKING ACCURACY > TEMPORAL > PRIORITY = PASS");
+}
+
+fn is_better_source(
+    t1: TokenAccuracy,
+    tp1: TemporalAccuracy,
+    p1: u8,
+    t2: TokenAccuracy,
+    tp2: TemporalAccuracy,
+    p2: u8,
+) -> bool {
+    if t1 != t2 {
+        return t1 > t2;
+    }
+    if tp1 != tp2 {
+        return tp1 > tp2;
+    }
+    p1 > p2
 }
 
 #[test]

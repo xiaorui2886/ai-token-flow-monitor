@@ -166,6 +166,7 @@ pub struct RawSourceSample {
     pub event_kind: EventKind,
     pub is_cumulative: bool,
     pub is_final: bool,
+    pub counter_reset_hint: bool, // P1-3: Explicit reset hint
     pub raw_usage: RawUsage,
     pub timing: TimingInfo,
     pub source_priority: u8,
@@ -224,7 +225,15 @@ pub enum InputThroughputMetric {
     Unavailable,
 }
 
-/// Canonical positive token delta (u64)
+/// Interval average OUT TPS metric for non-stream interval samples (P0-1)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct IntervalAverageMetric {
+    pub interval_tokens: u64,
+    pub interval_duration_sec: f64,
+    pub interval_tps: f64,
+}
+
+/// Canonical positive token delta (u64) with separate context & fresh input fields (P0-4)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalTokenDelta {
     pub delta_id: String,
@@ -239,7 +248,8 @@ pub struct CanonicalTokenDelta {
     pub agent_name: String,
     pub model: String,
     pub provider: String,
-    pub delta_input_tokens: u64,
+    pub delta_context_input_tokens: u64,
+    pub delta_fresh_input_tokens: u64,
     pub delta_output_tokens: u64,
     pub delta_cache_read: u64,
     pub delta_cache_write: u64,
@@ -260,7 +270,8 @@ pub struct CanonicalCorrection {
     pub collector_run_id: String,
     pub correlation_key: RequestCorrelationKey,
     pub wall_timestamp_ms: i64,
-    pub input_correction: i64,
+    pub context_input_correction: i64,
+    pub fresh_input_correction: i64,
     pub output_correction: i64,
     pub cache_read_correction: i64,
     pub cache_write_correction: i64,
@@ -272,30 +283,35 @@ pub struct CanonicalCorrection {
     pub new_total: u64,
 }
 
-/// Canonical request ledger tracking authoritative usage
+/// Canonical request ledger tracking authoritative usage with separate context & fresh input (P0-4)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalRequestLedger {
     pub correlation_key: RequestCorrelationKey,
     pub agent_id: String,
     pub model: String,
     pub provider: String,
-    pub canonical_input_total: u64,
+    pub canonical_context_input_total: u64,
+    pub canonical_fresh_input_total: u64,
     pub canonical_output_total: u64,
     pub canonical_cache_read: u64,
     pub canonical_cache_write: u64,
     pub canonical_reasoning: u64,
-    pub live_contributed_input: u64,
+    pub live_contributed_context_input: u64,
+    pub live_contributed_fresh_input: u64,
     pub live_contributed_output: u64,
     pub live_contributed_cache_read: u64,
     pub live_contributed_cache_write: u64,
     pub live_contributed_reasoning: u64,
-    pub authoritative_final_input: Option<u64>,
+    pub authoritative_final_context_input: Option<u64>,
+    pub authoritative_final_fresh_input: Option<u64>,
     pub authoritative_final_output: Option<u64>,
     pub authoritative_final_cache_read: Option<u64>,
     pub authoritative_final_cache_write: Option<u64>,
     pub authoritative_final_reasoning: Option<u64>,
     pub winning_source: String,
     pub active_live_source_priority: u8,
+    pub active_live_token_accuracy: TokenAccuracy,
+    pub active_live_temporal_accuracy: TemporalAccuracy,
     pub is_finalized: bool,
     pub normalization_version: u32,
     pub last_reconciled_at_ms: i64,
@@ -310,6 +326,19 @@ pub struct SourceCheckpoint {
     pub last_sequence_id: Option<u64>,
     pub watermark_timestamp_ms: i64,
     pub updated_at_ms: i64,
+}
+
+/// Today's aggregated token usage metrics (P1-1)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TodayTokenAggregates {
+    pub today_date_str: String,
+    pub today_context_input: u64,
+    pub today_fresh_input: u64,
+    pub today_output: u64,
+    pub today_cache_read: u64,
+    pub today_cache_write: u64,
+    pub today_reasoning: u64,
+    pub today_canonical_total: u64,
 }
 
 /// Orthogonal runtime flags for an agent
@@ -333,6 +362,7 @@ pub struct AgentStatus {
     pub flags: AgentRuntimeFlags,
     pub current_in_tps: Option<f64>,
     pub current_out_tps: f64,
+    pub interval_avg_metric: Option<IntervalAverageMetric>,
     pub today_tokens: u64,
     pub session_tokens: u64,
     pub token_accuracy: TokenAccuracy,

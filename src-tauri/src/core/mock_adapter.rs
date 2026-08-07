@@ -120,6 +120,7 @@ impl MockAdapter {
             event_kind: kind,
             is_cumulative,
             is_final: kind == EventKind::Final,
+            counter_reset_hint: false,
             raw_usage: RawUsage {
                 raw_input_tokens: Some(input),
                 raw_output_tokens: Some(output),

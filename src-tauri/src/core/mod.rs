@@ -22,7 +22,7 @@ use crate::core::request_ledger::RequestLedgerManager;
 use crate::core::tps_engine::TPSEngine;
 use crate::core::types::{
     AgentRuntimeFlags, AgentStatus, BaselineMode, CommittedDetails, EngineError, EventKind,
-    ProcessOutcome, RawSourceSample, UsageSemantics,
+    ProcessOutcome, RawSourceSample, SourceCheckpoint, UsageSemantics,
 };
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -53,6 +53,8 @@ impl EnginePipeline {
                     reconciler.restore_state(
                         l.correlation_key.clone(),
                         l.winning_source.clone(),
+                        l.active_live_token_accuracy,
+                        l.active_live_temporal_accuracy,
                         l.active_live_source_priority,
                     );
                     request_ledger.restore_ledger(l);
@@ -82,6 +84,16 @@ impl EnginePipeline {
         semantics: &UsageSemantics,
         mode: BaselineMode,
     ) -> Result<ProcessOutcome, EngineError> {
+        self.process_sample_with_checkpoint(sample, semantics, mode, None)
+    }
+
+    pub fn process_sample_with_checkpoint(
+        &mut self,
+        sample: &RawSourceSample,
+        semantics: &UsageSemantics,
+        mode: BaselineMode,
+        checkpoint: Option<&SourceCheckpoint>,
+    ) -> Result<ProcessOutcome, EngineError> {
         let normalized = UsageNormalizer::normalize(&sample.raw_usage, semantics);
         let correlation = RequestCorrelator::correlate(sample);
 
@@ -100,6 +112,7 @@ impl EnginePipeline {
             },
             current_in_tps: None,
             current_out_tps: 0.0,
+            interval_avg_metric: None,
             today_tokens: 0,
             session_tokens: 0,
             token_accuracy: sample.token_accuracy,
@@ -120,12 +133,12 @@ impl EnginePipeline {
                 None => vec![],
             };
 
-            // P0-11: Final ledger is persisted even if correction is None
+            // P0-11 & P0-5: Final ledger and Checkpoint are persisted in the SAME transaction!
             if let Err(e) = storage_guard.save_canonical_transaction(
                 &[],
                 &corrections_slice,
                 std::slice::from_ref(&updated_ledger),
-                None,
+                checkpoint,
             ) {
                 return Err(EngineError::StorageError(e.to_string()));
             }
@@ -153,7 +166,7 @@ impl EnginePipeline {
                         std::slice::from_ref(&canonical_delta),
                         &[],
                         std::slice::from_ref(ledger),
-                        None,
+                        checkpoint,
                     ) {
                         return Err(EngineError::StorageError(e.to_string()));
                     }
