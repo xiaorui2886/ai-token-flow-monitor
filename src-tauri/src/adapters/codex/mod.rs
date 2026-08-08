@@ -7,6 +7,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::adapters::common::jsonl::scan_safe_eof;
 use crate::core::types::ProcessOutcome;
 use crate::core::types::{
     BaselineMode, EngineError, EventKind, MeasurementKind, RawSourceSample, RawUsage,
@@ -139,10 +140,10 @@ pub struct FileScanResult {
 /// Scan `[0, end_offset)` recognizing ONLY newline-terminated complete records.
 /// A partial line at EOF is never included in `safe_complete_end_offset` — the tailer
 /// re-reads it from that offset once the line is completed by the next append.
+/// The Safe EOF position comes from the shared `common::jsonl::scan_safe_eof`.
 pub fn scan_file(path: &Path, end_offset: u64) -> FileScanResult {
     let data = std::fs::read(path).unwrap_or_default();
     let limit = (end_offset as usize).min(data.len());
-    let mut safe_end = 0u64;
     let mut last_snapshot: Option<(u64, CodexTokenSnapshot)> = None;
     let mut start = 0usize;
     for (i, &b) in data[..limit].iter().enumerate() {
@@ -151,12 +152,11 @@ pub fn scan_file(path: &Path, end_offset: u64) -> FileScanResult {
             if let Ok(Some(snap)) = parse_rollout_line(&data[start..end]) {
                 last_snapshot = Some((start as u64, snap));
             }
-            safe_end = end as u64;
             start = end;
         }
     }
     FileScanResult {
-        safe_complete_end_offset: safe_end,
+        safe_complete_end_offset: scan_safe_eof(&data, limit),
         last_token_snapshot: last_snapshot,
     }
 }

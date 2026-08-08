@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+pub use crate::adapters::common::identity::stable_path_hash;
+
 /// Discovered rollout JSONL file (metadata only, no content read).
 #[derive(Debug, Clone)]
 pub struct DiscoveredRollout {
@@ -111,23 +113,4 @@ impl Default for CodexDiscovery {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Stable, irreversible path hash: absolute path -> Windows separator normalization
-/// -> lowercase (case-insensitive) -> SHA-256 -> first 16 hex chars.
-///
-/// Never print the raw path in logs; only this hash.
-pub fn stable_path_hash(path: &Path) -> String {
-    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    let normalized = abs.to_string_lossy().replace('\\', "/").to_lowercase();
-
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(normalized.as_bytes());
-    let digest = hasher.finalize();
-    digest
-        .iter()
-        .take(8)
-        .map(|b| format!("{:02x}", b))
-        .collect()
 }
