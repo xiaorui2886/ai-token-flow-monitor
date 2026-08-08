@@ -45,31 +45,36 @@ impl EnginePipeline {
         let mut request_ledger = RequestLedgerManager::new();
         let mut reconciler = CrossSourceReconciler::new();
 
-        // P0-15 Startup Restoration of Canonical Ledgers, Checkpoints & Dedup Stable IDs from SQLite
+        // P0-15 Startup Restoration of Canonical Ledgers, Checkpoints & Dedup Stable IDs from SQLite.
+        // Task 02B-FIX §7: restore failures MUST propagate — never start an empty engine on broken storage.
         {
             let storage_guard = storage.lock();
-            if let Ok(ledgers) = storage_guard.load_ledgers() {
-                for l in ledgers {
-                    reconciler.restore_state(
-                        l.correlation_key.clone(),
-                        l.winning_source.clone(),
-                        l.active_live_token_accuracy,
-                        l.active_live_temporal_accuracy,
-                        l.active_live_source_priority,
-                        l.canonical_context_input_total,
-                        l.canonical_fresh_input_total,
-                        l.canonical_output_total,
-                        l.canonical_cache_read,
-                        l.canonical_cache_write,
-                        l.canonical_reasoning,
-                    );
-                    request_ledger.restore_ledger(l);
-                }
+            let ledgers = storage_guard.load_ledgers().map_err(|e| {
+                EngineError::StorageError(format!("load_ledgers failed on startup: {e}"))
+            })?;
+            for l in ledgers {
+                reconciler.restore_state(
+                    l.correlation_key.clone(),
+                    l.winning_source.clone(),
+                    l.active_live_token_accuracy,
+                    l.active_live_temporal_accuracy,
+                    l.active_live_source_priority,
+                    l.canonical_context_input_total,
+                    l.canonical_fresh_input_total,
+                    l.canonical_output_total,
+                    l.canonical_cache_read,
+                    l.canonical_cache_write,
+                    l.canonical_reasoning,
+                );
+                request_ledger.restore_ledger(l);
             }
-            if let Ok(stable_ids) = storage_guard.load_stable_ingestion_ids() {
-                for (source_id, stable_id) in stable_ids {
-                    reconciler.restore_stable_id(source_id, stable_id);
-                }
+            let stable_ids = storage_guard.load_stable_ingestion_ids().map_err(|e| {
+                EngineError::StorageError(format!(
+                    "load_stable_ingestion_ids failed on startup: {e}"
+                ))
+            })?;
+            for (source_id, stable_id) in stable_ids {
+                reconciler.restore_stable_id(source_id, stable_id);
             }
         }
 
@@ -148,6 +153,17 @@ impl EnginePipeline {
             ) {
                 return Err(EngineError::StorageError(e.to_string()));
             }
+
+            // Task 02F §25: record the EffectiveMeasured/PrefillExact IN metric ONLY AFTER the
+            // durable commit succeeded. A storage failure must never produce an IN metric.
+            // (TurnExact Final never enters Live OUT TPS — no buffer push here.)
+            self.tps_engine.record_input_measurement(
+                &sample.agent_id,
+                &sample.collector_run_id,
+                sample.observed_monotonic_ns,
+                normalized.normalized_context_input_tokens,
+                &sample.timing,
+            );
 
             return Ok(ProcessOutcome::Committed(Box::new(CommittedDetails {
                 delta: None,

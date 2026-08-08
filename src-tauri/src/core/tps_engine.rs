@@ -1,6 +1,6 @@
 use crate::core::types::{
     CanonicalTokenDelta, GapState, InputThroughputMetric, IntervalAverageMetric, MeasurementKind,
-    TemporalAccuracy,
+    TemporalAccuracy, TimingInfo,
 };
 use std::collections::{HashMap, VecDeque};
 
@@ -87,24 +87,14 @@ impl TPSEngine {
             );
         }
 
-        // Fix 4: Compute & store InputThroughputMetric with freshness timestamp (ns)
-        let in_metric = self.compute_input_metric(delta);
-        let in_tps_val = match in_metric {
-            InputThroughputMetric::PrefillExact(v) => Some(v),
-            InputThroughputMetric::EffectiveMeasured(v) => Some(v),
-            InputThroughputMetric::Unavailable => None,
-        };
-        if in_tps_val.is_some() {
-            self.agent_last_in_metrics.insert(
-                delta.agent_id.clone(),
-                (
-                    delta.collector_run_id.clone(),
-                    delta.observed_monotonic_ns,
-                    in_tps_val,
-                    in_metric,
-                ),
-            );
-        }
+        // Fix 4 & Task 02F §25: single shared helper records InputThroughputMetric (freshness ns).
+        self.record_input_measurement(
+            &delta.agent_id,
+            &delta.collector_run_id,
+            delta.observed_monotonic_ns,
+            delta.delta_context_input_tokens,
+            &delta.timing,
+        );
 
         let buffer = self
             .agent_buffers
@@ -127,9 +117,31 @@ impl TPSEngine {
         current_monotonic_ns: u64,
         current_run_id: &str,
     ) -> AgentTpsMetrics {
+        // Fix 4 & Task 02F §25/§28: Current IN TPS Freshness window (1s) is computed BEFORE the
+        // OUT buffer lookup — a Final-only agent (TurnExact, e.g. ZCode SQLite adapter) has no
+        // live OUT buffer but MUST still report its EffectiveMeasured/PrefillExact IN metric.
+        let (in_val, in_metric) = if let Some((run_id, ns, val, metric)) =
+            self.agent_last_in_metrics.get(agent_id)
+        {
+            if run_id == current_run_id && current_monotonic_ns.saturating_sub(*ns) <= 1_000_000_000
+            {
+                (*val, metric.clone())
+            } else {
+                (None, InputThroughputMetric::Unavailable)
+            }
+        } else {
+            (None, InputThroughputMetric::Unavailable)
+        };
+
         let buffer = match self.agent_buffers.get(agent_id) {
             Some(b) => b,
-            None => return AgentTpsMetrics::default(),
+            None => {
+                return AgentTpsMetrics {
+                    current_in_tps: in_val,
+                    input_metric: in_metric,
+                    ..Default::default()
+                }
+            }
         };
 
         if buffer.is_empty() {
@@ -194,20 +206,6 @@ impl TPSEngine {
             *peak = current_out_tps;
         }
 
-        // Fix 4: Current IN TPS Freshness window (1 second = 1_000_000_000 ns)
-        let (in_val, in_metric) = if let Some((run_id, ns, val, metric)) =
-            self.agent_last_in_metrics.get(agent_id)
-        {
-            if run_id == current_run_id && current_monotonic_ns.saturating_sub(*ns) <= 1_000_000_000
-            {
-                (*val, metric.clone())
-            } else {
-                (None, InputThroughputMetric::Unavailable)
-            }
-        } else {
-            (None, InputThroughputMetric::Unavailable)
-        };
-
         let interval_metric = self.agent_interval_metrics.get(agent_id).cloned();
 
         AgentTpsMetrics {
@@ -220,28 +218,63 @@ impl TPSEngine {
         }
     }
 
-    pub fn compute_input_metric(&self, delta: &CanonicalTokenDelta) -> InputThroughputMetric {
-        if let (Some(start), Some(end)) =
-            (delta.timing.prefill_start_ms, delta.timing.prefill_end_ms)
-        {
+    /// Compute an InputThroughputMetric from raw counters + timing using the frozen rules:
+    /// PrefillExact (prefill start/end) > EffectiveMeasured (request start -> first token) > Unavailable.
+    /// Task 02F §25: shared by BOTH `push_delta` (live delta path) and the Final authoritative path.
+    pub fn compute_input_metric_from_timing(
+        context_input_tokens: u64,
+        timing: &TimingInfo,
+    ) -> InputThroughputMetric {
+        if let (Some(start), Some(end)) = (timing.prefill_start_ms, timing.prefill_end_ms) {
             let dur_sec = (end - start) as f64 / 1000.0;
             if dur_sec > 0.0 {
-                return InputThroughputMetric::PrefillExact(
-                    delta.delta_context_input_tokens as f64 / dur_sec,
-                );
+                return InputThroughputMetric::PrefillExact(context_input_tokens as f64 / dur_sec);
             }
         }
-        if let (Some(start), Some(first)) =
-            (delta.timing.request_start_ms, delta.timing.first_token_ms)
-        {
+        if let (Some(start), Some(first)) = (timing.request_start_ms, timing.first_token_ms) {
             let ttft_sec = (first - start) as f64 / 1000.0;
             if ttft_sec > 0.0 {
                 return InputThroughputMetric::EffectiveMeasured(
-                    delta.delta_context_input_tokens as f64 / ttft_sec,
+                    context_input_tokens as f64 / ttft_sec,
                 );
             }
         }
         InputThroughputMetric::Unavailable
+    }
+
+    /// Task 02F §25: record an input measurement with its freshness timestamp (ns).
+    /// Stored ONLY when a measurable metric exists (never for `Unavailable`).
+    /// The Final path calls this AFTER the durable transaction committed — a storage failure
+    /// must never produce an IN metric.
+    pub fn record_input_measurement(
+        &mut self,
+        agent_id: &str,
+        collector_run_id: &str,
+        observed_monotonic_ns: u64,
+        context_input_tokens: u64,
+        timing: &TimingInfo,
+    ) {
+        let metric = Self::compute_input_metric_from_timing(context_input_tokens, timing);
+        let tps_val = match metric {
+            InputThroughputMetric::PrefillExact(v)
+            | InputThroughputMetric::EffectiveMeasured(v) => Some(v),
+            InputThroughputMetric::Unavailable => None,
+        };
+        if let Some(v) = tps_val {
+            self.agent_last_in_metrics.insert(
+                agent_id.to_string(),
+                (
+                    collector_run_id.to_string(),
+                    observed_monotonic_ns,
+                    Some(v),
+                    metric,
+                ),
+            );
+        }
+    }
+
+    pub fn compute_input_metric(&self, delta: &CanonicalTokenDelta) -> InputThroughputMetric {
+        Self::compute_input_metric_from_timing(delta.delta_context_input_tokens, &delta.timing)
     }
 
     pub fn update_global_peak(&mut self, current_global_out_tps: f64) {
