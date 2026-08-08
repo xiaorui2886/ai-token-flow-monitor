@@ -140,8 +140,9 @@ fn validate_existing() {
         let _ = cum_out;
     }
 
-    // Partial line safety: last byte of file must be newline.
-    let partial_line_safe = data.last().map(|&b| b == b'\n').unwrap_or(true);
+    // Partial line safety is proven by synthetic tests (C9 + C16), never by a real file.
+    // This flag only reports whether the observed real file happens to end with a newline.
+    let observed_eof_newline = data.last().map(|&b| b == b'\n').unwrap_or(true);
 
     println!("files_found={}", rollouts.len());
     println!("token_events_checked={}", events_checked);
@@ -150,7 +151,7 @@ fn validate_existing() {
     println!("cache_field_available=true");
     println!("reasoning_field_available=true");
     println!("restart_baseline_ok={}", restart_baseline_ok);
-    println!("partial_line_safe={}", partial_line_safe);
+    println!("observed_eof_newline={}", observed_eof_newline);
 }
 
 fn live_passive() {

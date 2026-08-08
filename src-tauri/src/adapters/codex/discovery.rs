@@ -32,6 +32,11 @@ impl CodexDiscovery {
         }
     }
 
+    /// Explicit root (tests use a synthetic `~/.codex` layout). The directory itself is treated as `~/.codex`.
+    pub fn with_root(root: PathBuf) -> Self {
+        Self { codex_dir: root }
+    }
+
     pub fn codex_dir(&self) -> &Path {
         &self.codex_dir
     }
