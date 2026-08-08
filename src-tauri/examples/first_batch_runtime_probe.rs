@@ -51,8 +51,8 @@ fn validate_existing() {
     for h in &snapshot.adapter_health {
         println!("{}_sources={}", h.agent_id, h.tracked_sources);
         println!(
-            "{}_health=available:{} degraded:{} fatal:{}",
-            h.agent_id, h.source_available, h.source_degraded, h.fatal
+            "{}_health=available:{} degraded:{} fatal:{} last_successful_poll:{}",
+            h.agent_id, h.source_available, h.source_degraded, h.fatal, h.last_successful_poll_ms
         );
     }
     println!(

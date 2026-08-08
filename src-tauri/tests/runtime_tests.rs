@@ -789,3 +789,291 @@ fn rt7_source_failure_isolation() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&dir2);
 }
+
+// ---------------------------------------------------------------------------
+// RT8 No Fake Active Agents
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rt8_no_fake_active_agents() {
+    let dir = temp_dir();
+    let roots = make_roots(&dir);
+    let mut runtime = CollectorRuntime::with_roots(
+        test_config(None),
+        Some(roots.codex_sessions.parent().unwrap().to_path_buf()),
+        Some(roots.claude.clone()),
+        Some(
+            roots
+                .zcode_db
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .to_path_buf(),
+        ),
+    )
+    .unwrap();
+    runtime.tick_with_observation(test_obs()).unwrap();
+
+    // Codex has usage, Claude has a Final, ZCode has a Final.
+    let codex_path = roots.codex_sessions.join("rollout-a.jsonl");
+    write_line(
+        &codex_path,
+        &codex_line("2026-07-29T09:00:00.000Z", 1000, 100),
+    );
+    let claude_path = roots.claude.join("t1.jsonl");
+    write_line(
+        &claude_path,
+        &claude_line("2026-07-29T09:00:00.000Z", "S1", "M1", "model-a", 1000, 60),
+    );
+    let conn = rusqlite::Connection::open(&roots.zcode_db).unwrap();
+    conn.execute_batch(ZCODE_SCHEMA).unwrap();
+    zcode_row(
+        &conn,
+        "r1",
+        "L1",
+        "S1",
+        "completed",
+        1000,
+        None,
+        2000,
+        1000,
+        40,
+    );
+    drop(conn);
+
+    let snap = runtime.tick_with_observation(test_obs()).unwrap();
+
+    // Usage cannot prove active agents (03A-FIX §1/§2).
+    assert_eq!(
+        snap.global_metrics.working_agents_count, 0,
+        "no fake working agents"
+    );
+    assert_eq!(
+        snap.global_metrics.generating_agents_count, 0,
+        "no StreamExact -> no generating"
+    );
+
+    // Ledgers still correct.
+    let codex_hash = stable_path_hash(&codex_path);
+    assert_eq!(codex_ledger(&runtime, &codex_hash), 100);
+    assert_eq!(claude_ledger(&runtime, "S1", "M1"), 60);
+    assert_eq!(zcode_ledger(&runtime, "S1", "L1"), 40);
+    println!("NO FAKE ACTIVE AGENTS = PASS");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// RT9 Source Health Truth
+// ---------------------------------------------------------------------------
+
+/// Hold an exclusive Windows handle (deny all sharing) so `std::fs::read` fails while
+/// `std::fs::metadata` still succeeds — a transient source read failure (03A-FIX §18).
+#[cfg(windows)]
+fn make_unreadable(path: &Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(path)
+        .unwrap()
+}
+
+#[test]
+fn rt9_source_health_truth() {
+    let dir = temp_dir();
+    let roots = make_roots(&dir);
+    let mut runtime = CollectorRuntime::with_roots(
+        test_config(None),
+        Some(roots.codex_sessions.parent().unwrap().to_path_buf()),
+        Some(roots.claude.clone()),
+        Some(
+            roots
+                .zcode_db
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .to_path_buf(),
+        ),
+    )
+    .unwrap();
+
+    // 1. No sources at all -> source_available=false for every agent.
+    let snap0 = runtime.tick_with_observation(test_obs()).unwrap();
+    for h in &snap0.adapter_health {
+        assert!(
+            !h.source_available,
+            "{}: no source -> not available",
+            h.agent_id
+        );
+    }
+
+    // 2. Codex + Claude sources exist but are temporarily unreadable; ZCode is healthy.
+    let codex_path = roots.codex_sessions.join("rollout-a.jsonl");
+    write_line(
+        &codex_path,
+        &codex_line("2026-07-29T09:00:00.000Z", 1000, 100),
+    );
+    let claude_path = roots.claude.join("t1.jsonl");
+    write_line(
+        &claude_path,
+        &claude_line("2026-07-29T09:00:00.000Z", "S1", "M1", "model-a", 1000, 60),
+    );
+    let conn = rusqlite::Connection::open(&roots.zcode_db).unwrap();
+    conn.execute_batch(ZCODE_SCHEMA).unwrap();
+    zcode_row(
+        &conn,
+        "r1",
+        "L1",
+        "S1",
+        "completed",
+        1000,
+        None,
+        2000,
+        1000,
+        40,
+    );
+    drop(conn);
+
+    let _guard_codex = make_unreadable(&codex_path);
+    let _guard_claude = make_unreadable(&claude_path);
+    let snap1 = runtime.tick_with_observation(test_obs()).unwrap();
+
+    let codex_h = snap1
+        .adapter_health
+        .iter()
+        .find(|h| h.agent_id == "codex")
+        .unwrap();
+    let claude_h = snap1
+        .adapter_health
+        .iter()
+        .find(|h| h.agent_id == "claude")
+        .unwrap();
+    let zcode_h = snap1
+        .adapter_health
+        .iter()
+        .find(|h| h.agent_id == "zcode")
+        .unwrap();
+    assert!(codex_h.source_degraded, "codex read failure -> degraded");
+    assert!(claude_h.source_degraded, "claude read failure -> degraded");
+    assert!(
+        !codex_h.fatal && !claude_h.fatal,
+        "source failure is not fatal"
+    );
+
+    // ZCode keeps working normally in the same runtime.
+    assert!(zcode_h.source_available, "zcode healthy");
+    assert!(!zcode_h.source_degraded);
+    assert_eq!(
+        zcode_ledger(&runtime, "S1", "L1"),
+        40,
+        "zcode processed in same tick"
+    );
+    println!("SOURCE HEALTH TRUTH = PASS");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// RT10 Last Successful Poll
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rt10_last_successful_poll() {
+    let dir = temp_dir();
+    let roots = make_roots(&dir);
+    let zcode_root = roots
+        .zcode_db
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut runtime = CollectorRuntime::with_roots(
+        test_config(None),
+        Some(roots.codex_sessions.parent().unwrap().to_path_buf()),
+        Some(roots.claude.clone()),
+        Some(zcode_root),
+    )
+    .unwrap();
+    runtime.tick_with_observation(test_obs()).unwrap();
+
+    // Tick A: source normal -> last_successful_poll_ms = A (wall 1000).
+    let conn = rusqlite::Connection::open(&roots.zcode_db).unwrap();
+    conn.execute_batch(ZCODE_SCHEMA).unwrap();
+    zcode_row(
+        &conn,
+        "r1",
+        "L1",
+        "S1",
+        "completed",
+        1000,
+        None,
+        2000,
+        1000,
+        40,
+    );
+    drop(conn);
+    let snap_a = runtime
+        .tick_with_observation(ObservationTime {
+            monotonic_ns: 1_000_000_000,
+            wall_timestamp_ms: 1_000,
+        })
+        .unwrap();
+    let a = snap_a
+        .adapter_health
+        .iter()
+        .find(|h| h.agent_id == "zcode")
+        .unwrap();
+    assert_eq!(a.last_successful_poll_ms, 1_000, "successful poll recorded");
+
+    // Tick B: source unavailable -> last_successful_poll_ms must STAY A.
+    std::fs::remove_file(&roots.zcode_db).unwrap();
+    let snap_b = runtime
+        .tick_with_observation(ObservationTime {
+            monotonic_ns: 2_000_000_000,
+            wall_timestamp_ms: 2_000,
+        })
+        .unwrap();
+    let b = snap_b
+        .adapter_health
+        .iter()
+        .find(|h| h.agent_id == "zcode")
+        .unwrap();
+    assert!(!b.source_available, "source gone");
+    assert_eq!(
+        b.last_successful_poll_ms, 1_000,
+        "unavailable poll must NOT advance last_successful_poll"
+    );
+
+    // Tick C: restored -> updated to C.
+    let conn = rusqlite::Connection::open(&roots.zcode_db).unwrap();
+    conn.execute_batch(ZCODE_SCHEMA).unwrap();
+    zcode_row(
+        &conn,
+        "r2",
+        "L2",
+        "S1",
+        "completed",
+        3000,
+        None,
+        4000,
+        1000,
+        20,
+    );
+    drop(conn);
+    let snap_c = runtime
+        .tick_with_observation(ObservationTime {
+            monotonic_ns: 3_000_000_000,
+            wall_timestamp_ms: 3_000,
+        })
+        .unwrap();
+    let c = snap_c
+        .adapter_health
+        .iter()
+        .find(|h| h.agent_id == "zcode")
+        .unwrap();
+    assert_eq!(c.last_successful_poll_ms, 3_000, "restored poll recorded");
+    println!("LAST SUCCESSFUL POLL = PASS");
+    let _ = std::fs::remove_dir_all(&dir);
+}

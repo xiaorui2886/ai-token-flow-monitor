@@ -47,6 +47,11 @@ pub struct CollectorRuntime {
     pub zcode: ZCodeAdapter,
     /// Set on any monitor durable failure: the whole runtime must be recreated.
     fatal: Option<String>,
+    /// Persistent per-agent health across ticks (Task 03A-FIX §11): last_successful_poll_ms
+    /// only advances on a truly successful readable poll; source-unavailable/fatal keep old.
+    codex_health: RuntimeAdapterHealth,
+    claude_health: RuntimeAdapterHealth,
+    zcode_health: RuntimeAdapterHealth,
 }
 
 impl CollectorRuntime {
@@ -118,6 +123,33 @@ impl CollectorRuntime {
             claude,
             zcode,
             fatal: None,
+            codex_health: RuntimeAdapterHealth {
+                agent_id: "codex".to_string(),
+                source_available: false,
+                tracked_sources: 0,
+                fatal: false,
+                source_degraded: false,
+                last_successful_poll_ms: 0,
+                last_error_kind: RuntimeErrorKind::None,
+            },
+            claude_health: RuntimeAdapterHealth {
+                agent_id: "claude".to_string(),
+                source_available: false,
+                tracked_sources: 0,
+                fatal: false,
+                source_degraded: false,
+                last_successful_poll_ms: 0,
+                last_error_kind: RuntimeErrorKind::None,
+            },
+            zcode_health: RuntimeAdapterHealth {
+                agent_id: "zcode".to_string(),
+                source_available: false,
+                tracked_sources: 0,
+                fatal: false,
+                source_degraded: false,
+                last_successful_poll_ms: 0,
+                last_error_kind: RuntimeErrorKind::None,
+            },
         })
     }
 
@@ -142,9 +174,9 @@ impl CollectorRuntime {
 
         // Monitor durable failure in ANY adapter -> whole runtime fatal; the tick aborts and
         // the remaining adapters stop ingesting (§24 RT7).
-        let mut codex_health = self.run_codex(&observation)?;
-        let mut claude_health = self.run_claude(&observation)?;
-        let mut zcode_health = self.run_zcode(&observation)?;
+        self.run_codex(&observation)?;
+        self.run_claude(&observation)?;
+        self.run_zcode(&observation)?;
 
         // §14: the three usage sources cannot prove request_active/generating — health and
         // token metrics stay separate; nothing is fabricated here.
@@ -154,16 +186,16 @@ impl CollectorRuntime {
             self.clock.run_id(),
         );
 
-        codex_health.last_successful_poll_ms = observation.wall_timestamp_ms;
-        claude_health.last_successful_poll_ms = observation.wall_timestamp_ms;
-        zcode_health.last_successful_poll_ms = observation.wall_timestamp_ms;
-
         Ok(RuntimeSnapshot {
             collector_run_id: self.clock.run_id().to_string(),
             observed_monotonic_ns: observation.monotonic_ns,
             wall_timestamp_ms: observation.wall_timestamp_ms,
             global_metrics,
-            adapter_health: vec![codex_health, claude_health, zcode_health],
+            adapter_health: vec![
+                self.codex_health.clone(),
+                self.claude_health.clone(),
+                self.zcode_health.clone(),
+            ],
         })
     }
 
@@ -171,22 +203,26 @@ impl CollectorRuntime {
         &mut self,
         observation: &ObservationTime,
     ) -> Result<RuntimeAdapterHealth, RuntimeError> {
-        let mut health = RuntimeAdapterHealth {
-            agent_id: "codex".to_string(),
-            source_available: true,
-            tracked_sources: self.codex.tracked_count(),
-            fatal: false,
-            source_degraded: false,
-            last_successful_poll_ms: 0,
-            last_error_kind: RuntimeErrorKind::None,
-        };
+        let mut health = self.codex_health.clone();
         match self
             .codex
             .refresh_discovery(&mut self.engine)
             .and_then(|_| self.codex.poll(&mut self.engine, observation))
         {
             Ok(stats) => {
+                // Task 03A-FIX §10: tracked=0 -> not available; degraded = any read failure.
                 health.tracked_sources = stats.files_tracked;
+                health.source_available = stats.sources_available > 0;
+                health.source_degraded = stats.source_read_failures > 0;
+                health.fatal = false;
+                health.last_error_kind = if stats.source_read_failures > 0 {
+                    RuntimeErrorKind::SourceUnavailable
+                } else {
+                    RuntimeErrorKind::None
+                };
+                if health.source_available && !health.source_degraded {
+                    health.last_successful_poll_ms = observation.wall_timestamp_ms;
+                }
             }
             Err(e) => {
                 // Monitor durable failure -> whole runtime fatal; stop ingesting.
@@ -199,6 +235,7 @@ impl CollectorRuntime {
                 )));
             }
         }
+        self.codex_health = health.clone();
         Ok(health)
     }
 
@@ -206,15 +243,7 @@ impl CollectorRuntime {
         &mut self,
         observation: &ObservationTime,
     ) -> Result<RuntimeAdapterHealth, RuntimeError> {
-        let mut health = RuntimeAdapterHealth {
-            agent_id: "claude".to_string(),
-            source_available: true,
-            tracked_sources: self.claude.tracked_count(),
-            fatal: false,
-            source_degraded: false,
-            last_successful_poll_ms: 0,
-            last_error_kind: RuntimeErrorKind::None,
-        };
+        let mut health = self.claude_health.clone();
         match self
             .claude
             .refresh_discovery(&mut self.engine)
@@ -222,6 +251,17 @@ impl CollectorRuntime {
         {
             Ok(stats) => {
                 health.tracked_sources = stats.files_tracked;
+                health.source_available = stats.sources_available > 0;
+                health.source_degraded = stats.source_read_failures > 0;
+                health.fatal = false;
+                health.last_error_kind = if stats.source_read_failures > 0 {
+                    RuntimeErrorKind::SourceUnavailable
+                } else {
+                    RuntimeErrorKind::None
+                };
+                if health.source_available && !health.source_degraded {
+                    health.last_successful_poll_ms = observation.wall_timestamp_ms;
+                }
             }
             Err(e) => {
                 health.fatal = true;
@@ -233,6 +273,7 @@ impl CollectorRuntime {
                 )));
             }
         }
+        self.claude_health = health.clone();
         Ok(health)
     }
 
@@ -240,15 +281,7 @@ impl CollectorRuntime {
         &mut self,
         observation: &ObservationTime,
     ) -> Result<RuntimeAdapterHealth, RuntimeError> {
-        let mut health = RuntimeAdapterHealth {
-            agent_id: "zcode".to_string(),
-            source_available: true,
-            tracked_sources: self.zcode.tracked_count(),
-            fatal: false,
-            source_degraded: false,
-            last_successful_poll_ms: 0,
-            last_error_kind: RuntimeErrorKind::None,
-        };
+        let mut health = self.zcode_health.clone();
         match self
             .zcode
             .refresh_discovery(&mut self.engine)
@@ -257,11 +290,17 @@ impl CollectorRuntime {
             Ok(stats) => {
                 health.tracked_sources = stats.sources_tracked;
                 // External source failures are NOT runtime fatal — degraded health only (RT7).
-                health.source_available = !stats.source_unavailable;
+                // tracked=0 -> not available (Task 03A-FIX §10).
+                health.source_available = stats.sources_tracked > 0 && !stats.source_unavailable;
                 health.source_degraded =
                     stats.source_unavailable || stats.health_unknown_status > 0;
-                if stats.source_unavailable {
-                    health.last_error_kind = RuntimeErrorKind::SourceUnavailable;
+                health.last_error_kind = if stats.source_unavailable {
+                    RuntimeErrorKind::SourceUnavailable
+                } else {
+                    RuntimeErrorKind::None
+                };
+                if health.source_available && !health.source_degraded {
+                    health.last_successful_poll_ms = observation.wall_timestamp_ms;
                 }
             }
             Err(e) => {
@@ -274,6 +313,7 @@ impl CollectorRuntime {
                 )));
             }
         }
+        self.zcode_health = health.clone();
         Ok(health)
     }
 }
