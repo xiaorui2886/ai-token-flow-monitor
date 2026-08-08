@@ -10,6 +10,7 @@ use ai_token_flow_monitor_lib::adapters::zcode::{
 use ai_token_flow_monitor_lib::core::persistence::StorageManager;
 use ai_token_flow_monitor_lib::core::types::*;
 use ai_token_flow_monitor_lib::core::EnginePipeline;
+use ai_token_flow_monitor_lib::runtime::types::ObservationTime;
 use parking_lot::Mutex;
 use rusqlite::params;
 use std::path::{Path, PathBuf};
@@ -265,7 +266,7 @@ fn zc3_openai_accounting() {
             Some(0),
         );
     });
-    adapter.poll(&mut engine).unwrap();
+    adapter.poll(&mut engine, &test_obs()).unwrap();
 
     let ledger = zcode_ledger(&engine, "S1", "L1").expect("ledger");
     assert_eq!(
@@ -313,7 +314,7 @@ fn zc4_reasoning_subset() {
             Some(0),
         );
     });
-    adapter.poll(&mut engine).unwrap();
+    adapter.poll(&mut engine, &test_obs()).unwrap();
 
     let ledger = zcode_ledger(&engine, "S1", "L1").expect("ledger");
     assert_eq!(
@@ -374,7 +375,7 @@ fn zc5_exact_request_identity() {
             Some(0),
         );
     });
-    adapter.poll(&mut engine).unwrap();
+    adapter.poll(&mut engine, &test_obs()).unwrap();
 
     let l1 = zcode_ledger(&engine, "S1", "L1").expect("L1 ledger");
     let l2 = zcode_ledger(&engine, "S1", "L2").expect("L2 ledger");
@@ -451,7 +452,7 @@ fn zc6_terminal_error_cancelled_usage() {
             Some(0),
         );
     });
-    let stats = adapter.poll(&mut engine).unwrap();
+    let stats = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(
         stats.authoritative_finals, 3,
         "all terminal statuses counted"
@@ -501,7 +502,7 @@ fn zc7_initial_attach() {
 
     let mut adapter = adapter_for(&dir);
     adapter.refresh_discovery(&mut engine).unwrap(); // initial attach -> boundary = 2000
-    let stats1 = adapter.poll(&mut engine).unwrap();
+    let stats1 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(
         stats1.authoritative_finals, 0,
         "history must NOT be imported"
@@ -529,7 +530,7 @@ fn zc7_initial_attach() {
         Some(0),
     );
     drop(conn);
-    let stats2 = adapter.poll(&mut engine).unwrap();
+    let stats2 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(stats2.authoritative_finals, 1);
     let ledger = zcode_ledger(&engine, "S1", "LNew").expect("new ledger");
     assert_eq!(ledger.canonical_output_total, 50);
@@ -607,7 +608,7 @@ fn zc8_runtime_db_appear() {
         1,
         "runtime DB attached"
     );
-    let stats = adapter.poll(&mut engine).unwrap();
+    let stats = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(
         stats.authoritative_finals, 2,
         "runtime rows must be fully captured"
@@ -667,10 +668,10 @@ fn zc9_watermark_overlap_dedup() {
             Some(0),
         );
     });
-    let s1 = adapter.poll(&mut engine).unwrap();
+    let s1 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(s1.authoritative_finals, 2);
     // Overlap re-read of the SAME rows (still within lookback) -> dedup, no new finals.
-    let s2 = adapter.poll(&mut engine).unwrap();
+    let s2 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(s2.authoritative_finals, 0);
     assert_eq!(s2.identical_final_dedup, 2);
     let l1 = zcode_ledger(&engine, "S1", "L1").unwrap();
@@ -710,7 +711,7 @@ fn zc10_changed_row_reconciliation() {
             Some(0),
         );
     });
-    adapter.poll(&mut engine).unwrap();
+    adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(
         zcode_ledger(&engine, "S1", "L1")
             .unwrap()
@@ -727,7 +728,7 @@ fn zc10_changed_row_reconciliation() {
     .unwrap();
     drop(conn);
 
-    let stats = adapter.poll(&mut engine).unwrap();
+    let stats = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(
         stats.changed_final_rewrites, 1,
         "health counter must increment"
@@ -790,7 +791,7 @@ fn zc11_same_completed_at() {
             Some(0),
         );
     });
-    let stats = adapter.poll(&mut engine).unwrap();
+    let stats = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(
         stats.authoritative_finals, 2,
         "same completed_at must not drop a row"
@@ -841,7 +842,7 @@ fn zc12_durable_restart() {
             Some(0),
         );
         drop(conn);
-        adapter.poll(&mut engine).unwrap();
+        adapter.poll(&mut engine, &test_obs()).unwrap();
         assert_eq!(
             zcode_ledger(&engine, "S1", "L1")
                 .unwrap()
@@ -856,7 +857,7 @@ fn zc12_durable_restart() {
         let mut engine = EnginePipeline::new("zcode_run2", storage.clone()).unwrap();
         let mut adapter = adapter_for(&dir);
         adapter.refresh_discovery(&mut engine).unwrap();
-        adapter.poll(&mut engine).unwrap(); // overlap re-reads M1 -> dedup
+        adapter.poll(&mut engine, &test_obs()).unwrap(); // overlap re-reads M1 -> dedup
 
         let conn = rusqlite::Connection::open(&ext_db).unwrap();
         insert_row(
@@ -878,7 +879,7 @@ fn zc12_durable_restart() {
             Some(0),
         );
         drop(conn);
-        let stats = adapter.poll(&mut engine).unwrap();
+        let stats = adapter.poll(&mut engine, &test_obs()).unwrap();
         assert_eq!(stats.authoritative_finals, 1);
         let l1 = zcode_ledger(&engine, "S1", "L1").unwrap();
         let l2 = zcode_ledger(&engine, "S1", "L2").unwrap();
@@ -935,7 +936,7 @@ fn zc13_duplicate_after_restart() {
             Some(0),
         );
         drop(conn);
-        adapter.poll(&mut engine).unwrap();
+        adapter.poll(&mut engine, &test_obs()).unwrap();
     }
 
     // Run 2: overlap re-reads the old request -> identical dedup, still exactly 100.
@@ -944,7 +945,7 @@ fn zc13_duplicate_after_restart() {
         let mut engine = EnginePipeline::new("zcode_run2", storage.clone()).unwrap();
         let mut adapter = adapter_for(&dir);
         adapter.refresh_discovery(&mut engine).unwrap();
-        let stats = adapter.poll(&mut engine).unwrap();
+        let stats = adapter.poll(&mut engine, &test_obs()).unwrap();
         assert_eq!(stats.identical_final_dedup, 1);
         assert_eq!(stats.authoritative_finals, 0);
         let ledger = zcode_ledger(&engine, "S1", "L1").unwrap();
@@ -985,16 +986,15 @@ fn zc14_ttft_effective_in() {
             Some(0),
         );
     });
-    adapter.poll(&mut engine).unwrap();
+    adapter.poll(&mut engine, &test_obs()).unwrap();
 
-    // Freshness clock: the adapter records observed_monotonic_ns from its own Instant anchor
-    // (created during poll). An anchor created NOW guarantees current <= stored, so the
-    // 1-second freshness slot is satisfied deterministically.
-    let anchor = std::time::Instant::now();
-    let now_ns = anchor.elapsed().as_nanos() as u64;
+    // Freshness: the sample's observed_monotonic_ns comes from the SHARED synthetic
+    // observation (1e9). Querying with the same observation timestamp is deterministic —
+    // diff 0 <= 1s -> Effective IN visible.
+    let obs_ns = test_obs().monotonic_ns;
     let metrics = engine
         .tps_engine
-        .calculate_agent_tps("zcode", now_ns, "zcode_test_run");
+        .calculate_agent_tps("zcode", obs_ns, "zcode_test_run");
     let in_tps = metrics.current_in_tps.expect("Effective IN TPS must exist");
     assert!(
         (in_tps - 40_000.0).abs() < 0.001,
@@ -1008,7 +1008,7 @@ fn zc14_ttft_effective_in() {
     // Global IN: 40000, coverage 1/1.
     let g = engine.global_aggregator.compute_global_metrics(
         &mut engine.tps_engine,
-        now_ns,
+        obs_ns,
         "zcode_test_run",
     );
     assert_eq!(g.in_coverage_measured, 1);
@@ -1049,7 +1049,7 @@ fn zc15_ttft_missing() {
             Some(0),
         );
     });
-    adapter.poll(&mut engine).unwrap();
+    adapter.poll(&mut engine, &test_obs()).unwrap();
 
     let metrics =
         engine
@@ -1090,7 +1090,7 @@ fn zc16_final_no_out_tps() {
             Some(0),
         );
     });
-    adapter.poll(&mut engine).unwrap();
+    adapter.poll(&mut engine, &test_obs()).unwrap();
 
     let metrics =
         engine
@@ -1133,12 +1133,12 @@ fn zc17_storage_failure() {
 
     let mut adapter = adapter_for(&dir);
     adapter.refresh_discovery(&mut engine).unwrap();
-    let err = adapter.poll(&mut engine).unwrap_err(); // initial attach checkpoint persist fails
+    let err = adapter.poll(&mut engine, &test_obs()).unwrap_err(); // initial attach checkpoint persist fails
     assert!(
         matches!(err, ZCodeAdapterError::CheckpointPersist),
         "expected CheckpointPersist, got {err:?}"
     );
-    let err2 = adapter.poll(&mut engine).unwrap_err();
+    let err2 = adapter.poll(&mut engine, &test_obs()).unwrap_err();
     assert!(matches!(err2, ZCodeAdapterError::FatalNeedsEngineRestart));
     let ledgers = storage.lock().load_ledgers().unwrap();
     assert!(
@@ -1179,7 +1179,7 @@ fn zc18_external_db_read_failure() {
             Some(0),
         );
     });
-    let s1 = adapter.poll(&mut engine).unwrap();
+    let s1 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(s1.authoritative_finals, 1);
     let watermark_before = {
         let cps = storage.lock().load_checkpoints().unwrap();
@@ -1191,7 +1191,7 @@ fn zc18_external_db_read_failure() {
 
     // External DB disappears -> SourceUnavailable: Ok poll, checkpoint untouched, NOT fatal.
     std::fs::remove_file(&db_path).unwrap();
-    let s2 = adapter.poll(&mut engine).unwrap();
+    let s2 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert!(
         s2.source_unavailable,
         "external read failure must be reported"
@@ -1230,7 +1230,7 @@ fn zc18_external_db_read_failure() {
         Some(0),
     );
     drop(conn);
-    let s3 = adapter.poll(&mut engine).unwrap();
+    let s3 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(s3.authoritative_finals, 1);
     let l2 = zcode_ledger(&engine, "S1", "L2").expect("L2 ledger");
     assert_eq!(l2.canonical_output_total, 60);
@@ -1286,7 +1286,7 @@ fn zc19_provider_model_passthrough() {
             Some(0),
         );
     });
-    adapter.poll(&mut engine).unwrap();
+    adapter.poll(&mut engine, &test_obs()).unwrap();
 
     let l1 = zcode_ledger(&engine, "S1", "L1").unwrap();
     let l2 = zcode_ledger(&engine, "S1", "L2").unwrap();
@@ -1342,7 +1342,7 @@ fn zc20_no_cross_source_double_count() {
     )
     .unwrap();
 
-    let stats = adapter.poll(&mut engine).unwrap();
+    let stats = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(
         stats.authoritative_finals, 1,
         "canonical comes from SQLite only"
@@ -1392,6 +1392,7 @@ fn _refs() {
             cancelled_by_user: false,
             context_exceeded: false,
         },
+        &test_obs(),
     );
     let _ = DiscoveredZCodeDb {
         path: PathBuf::new(),
@@ -1459,7 +1460,7 @@ fn zc21_startup_attach_retry_safety() {
         1,
         "retry attach succeeds"
     );
-    let stats1 = adapter.poll(&mut engine).unwrap();
+    let stats1 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(
         stats1.authoritative_finals, 0,
         "history 5000 must NOT be imported"
@@ -1491,7 +1492,7 @@ fn zc21_startup_attach_retry_safety() {
             Some(0),
         );
     }
-    let stats2 = adapter.poll(&mut engine).unwrap();
+    let stats2 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(stats2.authoritative_finals, 1);
     let ledger = zcode_ledger(&engine, "S1", "LNew").expect("new ledger");
     assert_eq!(ledger.canonical_output_total, 50);
@@ -1557,7 +1558,7 @@ fn zc22_unknown_status_watermark_barrier() {
 
     // First poll: A not counted; B must NOT be processed past the barrier; watermark stays
     // before A; adapter NOT fatal.
-    let s1 = adapter.poll(&mut engine).unwrap();
+    let s1 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(s1.health_unknown_status, 1);
     assert_eq!(
         s1.authoritative_finals, 0,
@@ -1575,7 +1576,7 @@ fn zc22_unknown_status_watermark_barrier() {
         )
         .unwrap();
     }
-    let s2 = adapter.poll(&mut engine).unwrap();
+    let s2 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(s2.authoritative_finals, 2);
     let la = zcode_ledger(&engine, "S1", "LA").unwrap();
     let lb = zcode_ledger(&engine, "S1", "LB").unwrap();
@@ -1618,7 +1619,7 @@ fn zc23_final_metadata_reconciliation() {
             Some(0),
         );
     });
-    adapter.poll(&mut engine).unwrap();
+    adapter.poll(&mut engine, &test_obs()).unwrap();
     let l = zcode_ledger(&engine, "S1", "L1").unwrap();
     assert_eq!(
         (
@@ -1640,7 +1641,7 @@ fn zc23_final_metadata_reconciliation() {
     }
 
     // Poll 1: metadata change -> one changed_final_rewrite; ledger metadata reconciled.
-    let s2 = adapter.poll(&mut engine).unwrap();
+    let s2 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(
         s2.changed_final_rewrites, 1,
         "metadata change must reconcile once"
@@ -1653,9 +1654,17 @@ fn zc23_final_metadata_reconciliation() {
     assert_eq!(l2.canonical_output_total, 100, "token numbers unchanged");
 
     // Poll 2: must converge to identical_final_dedup — never changed forever.
-    let s3 = adapter.poll(&mut engine).unwrap();
+    let s3 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(s3.changed_final_rewrites, 0);
     assert_eq!(s3.identical_final_dedup, 1);
     println!("FINAL METADATA RECONCILIATION = PASS");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Deterministic synthetic observation (Task 03A §7): tests never create adapter-local clocks.
+fn test_obs() -> ObservationTime {
+    ObservationTime {
+        monotonic_ns: 1_000_000_000,
+        wall_timestamp_ms: 1_700_000_000_000,
+    }
 }

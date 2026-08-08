@@ -12,6 +12,7 @@ use crate::core::types::{
     TemporalAccuracy, TimingInfo, TokenAccuracy, UsageAccountingStrategy, UsageSemantics,
 };
 use crate::core::EnginePipeline;
+use crate::runtime::types::ObservationTime;
 
 use discovery::{DiscoveredZCodeDb, ZCodeDiscovery};
 use reader::{fetch_max_terminal_completed_at, fetch_rows, open_read_only, ExternalReadError};
@@ -25,13 +26,6 @@ pub const ZCODE_AGENT_NAME: &str = "ZCode";
 pub const ZCODE_ACCOUNTING_PROVIDER: &str = "zcode";
 /// Task 02F §17: overlap replay window (ZCODE_DB_LOOKBACK_MS = 10 minutes).
 pub const DEFAULT_LOOKBACK_MS: i64 = 600_000;
-
-static ADAPTER_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-
-fn monotonic_now_ns() -> u64 {
-    let start = *ADAPTER_START.get_or_init(Instant::now);
-    start.elapsed().as_nanos() as u64
-}
 
 /// Frozen Ground Truth semantics for ZCode model_usage.
 pub fn zcode_semantics() -> UsageSemantics {
@@ -64,6 +58,7 @@ pub fn build_final_sample(
     db_hash: &str,
     collector_run_id: &str,
     row: &ZCodeUsageRow,
+    observation: &ObservationTime,
 ) -> RawSourceSample {
     let session_id = zcode_session_id(&row.session_id);
     let request_id = zcode_request_id(&row.logical_request_id);
@@ -76,8 +71,8 @@ pub fn build_final_sample(
         collector_run_id: collector_run_id.to_string(),
         source_adapter_id: format!("zcode_model_usage_{}", db_hash),
         source_type: SourceType::SQLite,
-        observed_monotonic_ns: monotonic_now_ns(),
-        wall_timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        observed_monotonic_ns: observation.monotonic_ns,
+        wall_timestamp_ms: observation.wall_timestamp_ms,
         source_timestamp_ms: Some(row.completed_at),
         process_id: None,
         agent_id: ZCODE_AGENT_ID.to_string(),
@@ -364,6 +359,7 @@ impl ZCodeAdapter {
     pub fn poll(
         &mut self,
         engine: &mut EnginePipeline,
+        observation: &ObservationTime,
     ) -> Result<ZCodePollStats, ZCodeAdapterError> {
         if self.fatal.is_some() {
             return Err(ZCodeAdapterError::FatalNeedsEngineRestart);
@@ -373,7 +369,13 @@ impl ZCodeAdapter {
             ..Default::default()
         };
         if let Some(state) = self.db_state.as_mut() {
-            if let Err(e) = Self::poll_db(state, self.config.lookback_ms, engine, &mut stats) {
+            if let Err(e) = Self::poll_db(
+                state,
+                self.config.lookback_ms,
+                engine,
+                observation,
+                &mut stats,
+            ) {
                 // §14: OUR durable storage failure -> fatal halt; adapter must be recreated.
                 self.fatal = Some(e);
                 return Err(e);
@@ -386,6 +388,7 @@ impl ZCodeAdapter {
         state: &mut ZCodeDbState,
         lookback_ms: i64,
         engine: &mut EnginePipeline,
+        observation: &ObservationTime,
         stats: &mut ZCodePollStats,
     ) -> Result<(), ZCodeAdapterError> {
         // §15: persist the initial watermark checkpoint at the first poll.
@@ -472,7 +475,8 @@ impl ZCodeAdapter {
                 stats.changed_final_rewrites += 1;
             }
 
-            let sample = build_final_sample(&state.db_hash, &engine.collector_run_id, &row);
+            let sample =
+                build_final_sample(&state.db_hash, &engine.collector_run_id, &row, observation);
             match engine.process_sample_with_checkpoint(
                 &sample,
                 &zcode_semantics(),

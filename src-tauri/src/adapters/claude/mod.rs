@@ -16,6 +16,7 @@ use crate::core::types::{
     TimingInfo, TokenAccuracy, UsageAccountingStrategy, UsageSemantics,
 };
 use crate::core::EnginePipeline;
+use crate::runtime::types::ObservationTime;
 
 use discovery::{ClaudeDiscovery, DiscoveredTranscript};
 use parser::{parse_claude_line, ClaudeUsageFinality, ClaudeUsageRecord};
@@ -26,13 +27,6 @@ pub const CLAUDE_AGENT_NAME: &str = "Claude Code";
 /// Source client / accounting surface — NOT a declaration of the upstream model provider.
 pub const CLAUDE_PROVIDER: &str = "claude_code";
 pub const CLAUDE_MODEL_UNKNOWN: &str = "unknown";
-
-static ADAPTER_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-
-fn monotonic_now_ns() -> u64 {
-    let start = *ADAPTER_START.get_or_init(Instant::now);
-    start.elapsed().as_nanos() as u64
-}
 
 /// Frozen Ground Truth semantics for Claude Code transcripts.
 pub fn claude_semantics() -> UsageSemantics {
@@ -54,11 +48,13 @@ pub fn claude_message_id(raw_message: &str) -> String {
 }
 
 /// Build the canonical RawSourceSample for an AuthoritativeFinal record (§12-§13).
+/// `observation` comes from the runtime SHARED CollectorClock (Task 03A §6).
 pub fn build_final_sample(
     file_hash: &str,
     collector_run_id: &str,
     record: &ClaudeUsageRecord,
     line_start_offset: u64,
+    observation: &ObservationTime,
 ) -> RawSourceSample {
     let session_id = record
         .session_id
@@ -76,8 +72,8 @@ pub fn build_final_sample(
         collector_run_id: collector_run_id.to_string(),
         source_adapter_id: format!("claude_transcript_{}", file_hash),
         source_type: SourceType::JSONL,
-        observed_monotonic_ns: monotonic_now_ns(),
-        wall_timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        observed_monotonic_ns: observation.monotonic_ns,
+        wall_timestamp_ms: observation.wall_timestamp_ms,
         source_timestamp_ms: record.source_timestamp_ms,
         process_id: None,
         agent_id: CLAUDE_AGENT_ID.to_string(),
@@ -312,9 +308,11 @@ impl ClaudeAdapter {
     }
 
     /// Poll all tracked files once and feed the engine.
+    /// `observation` comes from the runtime SHARED CollectorClock — never an adapter-local clock.
     pub fn poll(
         &mut self,
         engine: &mut EnginePipeline,
+        observation: &ObservationTime,
     ) -> Result<ClaudePollStats, ClaudeAdapterError> {
         if self.fatal.is_some() {
             return Err(ClaudeAdapterError::FatalNeedsEngineRestart);
@@ -324,7 +322,7 @@ impl ClaudeAdapter {
             ..Default::default()
         };
         for state in self.files.values_mut() {
-            if let Err(e) = Self::poll_file(state, engine, &mut stats) {
+            if let Err(e) = Self::poll_file(state, engine, observation, &mut stats) {
                 self.fatal = Some(e);
                 return Err(e);
             }
@@ -335,6 +333,7 @@ impl ClaudeAdapter {
     fn poll_file(
         state: &mut TranscriptFileState,
         engine: &mut EnginePipeline,
+        observation: &ObservationTime,
         stats: &mut ClaudePollStats,
     ) -> Result<(), ClaudeAdapterError> {
         let file_size = std::fs::metadata(&state.path).map(|m| m.len()).unwrap_or(0);
@@ -372,7 +371,7 @@ impl ClaudeAdapter {
             }
             let lines = state.tailer.feed(&chunk);
             for line in lines {
-                Self::process_line(state, line, engine, stats)?;
+                Self::process_line(state, line, engine, observation, stats)?;
             }
         }
         Ok(())
@@ -394,6 +393,7 @@ impl ClaudeAdapter {
         state: &mut TranscriptFileState,
         line: JsonlLine,
         engine: &mut EnginePipeline,
+        observation: &ObservationTime,
         stats: &mut ClaudePollStats,
     ) -> Result<(), ClaudeAdapterError> {
         match parse_claude_line(&line.bytes) {
@@ -472,6 +472,7 @@ impl ClaudeAdapter {
                             &engine.collector_run_id,
                             &record,
                             line.line_start_offset,
+                            observation,
                         );
 
                         // §14: Final path -> Core authoritative reconciliation; BaselineMode is

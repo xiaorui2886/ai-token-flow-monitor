@@ -15,6 +15,7 @@ use crate::core::types::{
     TokenAccuracy, UsageAccountingStrategy, UsageSemantics,
 };
 use crate::core::EnginePipeline;
+use crate::runtime::types::ObservationTime;
 
 use discovery::{CodexDiscovery, DiscoveredRollout};
 use parser::{parse_rollout_line, CodexTokenSnapshot};
@@ -28,13 +29,6 @@ pub const CODEX_MODEL_UNKNOWN: &str = "unknown";
 /// Internal canonical aggregation bucket for a rollout file (NOT a native Codex request id).
 pub const CODEX_LOGICAL_REQUEST_ID: &str = "session_cumulative";
 
-static ADAPTER_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-
-fn monotonic_now_ns() -> u64 {
-    let start = *ADAPTER_START.get_or_init(Instant::now);
-    start.elapsed().as_nanos() as u64
-}
-
 /// Frozen Ground Truth semantics for Codex rollout JSONL.
 pub fn codex_semantics() -> UsageSemantics {
     UsageSemantics {
@@ -46,6 +40,8 @@ pub fn codex_semantics() -> UsageSemantics {
 
 /// Build a RawSourceSample for one token_count record.
 /// - cumulative snapshot, no identity guessing, no fake IN timing.
+/// - `observation` comes from the runtime SHARED CollectorClock (Task 03A §6) — the adapter
+///   never creates its own time axis.
 pub fn build_snapshot_sample(
     file_hash: &str,
     session_id: &str,
@@ -53,14 +49,15 @@ pub fn build_snapshot_sample(
     snapshot: &CodexTokenSnapshot,
     line_start_offset: u64,
     interval_ms: Option<u64>,
+    observation: &ObservationTime,
 ) -> RawSourceSample {
     RawSourceSample {
         sample_id: format!("codex_{}_{}", file_hash, line_start_offset),
         collector_run_id: collector_run_id.to_string(),
         source_adapter_id: format!("codex_rollout_{}", file_hash),
         source_type: SourceType::JSONL,
-        observed_monotonic_ns: monotonic_now_ns(),
-        wall_timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        observed_monotonic_ns: observation.monotonic_ns,
+        wall_timestamp_ms: observation.wall_timestamp_ms,
         source_timestamp_ms: snapshot.source_timestamp_ms,
         process_id: None,
         agent_id: CODEX_AGENT_ID.to_string(),
@@ -364,8 +361,13 @@ impl CodexAdapter {
     }
 
     /// Poll all tracked files once and feed the engine.
+    /// `observation` comes from the runtime SHARED CollectorClock — never an adapter-local clock.
     /// On any durable failure the adapter halts permanently (drop + recreate required).
-    pub fn poll(&mut self, engine: &mut EnginePipeline) -> Result<PollStats, CodexAdapterError> {
+    pub fn poll(
+        &mut self,
+        engine: &mut EnginePipeline,
+        observation: &ObservationTime,
+    ) -> Result<PollStats, CodexAdapterError> {
         if self.fatal.is_some() {
             // §9: after a storage failure this adapter instance must not ingest anything more.
             return Err(CodexAdapterError::FatalNeedsEngineRestart);
@@ -375,7 +377,7 @@ impl CodexAdapter {
             ..Default::default()
         };
         for state in self.files.values_mut() {
-            if let Err(e) = Self::poll_file(state, engine, &mut stats) {
+            if let Err(e) = Self::poll_file(state, engine, observation, &mut stats) {
                 self.fatal = Some(e);
                 return Err(e);
             }
@@ -386,6 +388,7 @@ impl CodexAdapter {
     fn poll_file(
         state: &mut RolloutFileState,
         engine: &mut EnginePipeline,
+        observation: &ObservationTime,
         stats: &mut PollStats,
     ) -> Result<(), CodexAdapterError> {
         let file_size = std::fs::metadata(&state.path).map(|m| m.len()).unwrap_or(0);
@@ -424,6 +427,7 @@ impl CodexAdapter {
                 &warm_snap,
                 warm_offset,
                 None,
+                observation,
             );
             engine
                 .process_sample(&sample, &codex_semantics(), BaselineMode::ReplayRestore)
@@ -458,7 +462,7 @@ impl CodexAdapter {
             let lines = state.tailer.feed(&chunk);
             // §13: one fatal record aborts the whole chunk — N+1/N+2 must NOT be processed.
             for line in lines {
-                Self::process_line(state, line, engine, stats)?;
+                Self::process_line(state, line, engine, observation, stats)?;
             }
         }
         Ok(())
@@ -480,6 +484,7 @@ impl CodexAdapter {
         state: &mut RolloutFileState,
         line: JsonlLine,
         engine: &mut EnginePipeline,
+        observation: &ObservationTime,
         stats: &mut PollStats,
     ) -> Result<(), CodexAdapterError> {
         match parse_rollout_line(&line.bytes) {
@@ -515,6 +520,7 @@ impl CodexAdapter {
                     &snapshot,
                     line.line_start_offset,
                     interval_ms,
+                    observation,
                 );
                 let mode = state.mode_for_next;
 
