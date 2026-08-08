@@ -15,6 +15,7 @@ use ai_token_flow_monitor_lib::adapters::common::identity::stable_path_hash;
 use ai_token_flow_monitor_lib::core::persistence::StorageManager;
 use ai_token_flow_monitor_lib::core::types::*;
 use ai_token_flow_monitor_lib::core::EnginePipeline;
+use ai_token_flow_monitor_lib::runtime::types::ObservationTime;
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -244,7 +245,7 @@ fn cl5_anthropic_accounting() {
     let dir = temp_dir();
     let (path, t) = write_transcript(&dir, "t5.jsonl", &[]);
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&t, None);
+    adapter.add_tracked_file(&t, None).unwrap();
     append_line(
         &path,
         &assistant_line(
@@ -259,7 +260,7 @@ fn cl5_anthropic_accounting() {
             Some(500),
         ),
     );
-    let stats = adapter.poll(&mut engine).unwrap();
+    let stats = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(stats.authoritative_finals, 1);
     let ledger = claude_ledger(&engine, "s1", "m1").expect("ledger must exist");
     assert_eq!(ledger.canonical_fresh_input_total, 2000, "Fresh = input");
@@ -285,7 +286,7 @@ fn cl6_reasoning_unavailable() {
     let dir = temp_dir();
     let (path, t) = write_transcript(&dir, "t6.jsonl", &[]);
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&t, None);
+    adapter.add_tracked_file(&t, None).unwrap();
     // Model name contains "thinking" — must NOT create reasoning tokens.
     append_line(
         &path,
@@ -301,7 +302,7 @@ fn cl6_reasoning_unavailable() {
             Some(0),
         ),
     );
-    adapter.poll(&mut engine).unwrap();
+    adapter.poll(&mut engine, &test_obs()).unwrap();
     let ledger = claude_ledger(&engine, "s1", "m1").expect("ledger must exist");
     assert_eq!(
         ledger.canonical_reasoning, 0,
@@ -321,7 +322,7 @@ fn cl7_per_message_final() {
     let dir = temp_dir();
     let (path, t) = write_transcript(&dir, "t7.jsonl", &[]);
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&t, None);
+    adapter.add_tracked_file(&t, None).unwrap();
     append_line(
         &path,
         &assistant_line(
@@ -350,7 +351,7 @@ fn cl7_per_message_final() {
             Some(0),
         ),
     );
-    adapter.poll(&mut engine).unwrap();
+    adapter.poll(&mut engine, &test_obs()).unwrap();
     let a = claude_ledger(&engine, "s1", "mA").expect("ledger A");
     let b = claude_ledger(&engine, "s1", "mB").expect("ledger B");
     assert_eq!(a.canonical_output_total, 100, "message A ledger = 100");
@@ -370,7 +371,7 @@ fn cl8_identical_reemit() {
     let dir = temp_dir();
     let (path, t) = write_transcript(&dir, "t8.jsonl", &[]);
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&t, None);
+    adapter.add_tracked_file(&t, None).unwrap();
     let line = assistant_line(
         "2026-07-29T09:00:00.000Z",
         "s1",
@@ -385,7 +386,7 @@ fn cl8_identical_reemit() {
     for _ in 0..6 {
         append_line(&path, &line);
     }
-    let stats = adapter.poll(&mut engine).unwrap();
+    let stats = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(stats.authoritative_finals, 1, "only ONE canonical final");
     assert_eq!(stats.identical_reemit_dedup, 5);
     let ledger = claude_ledger(&engine, "s1", "m1").expect("ledger");
@@ -416,7 +417,7 @@ fn cl9_placeholder_to_final() {
     let dir = temp_dir();
     let (path, t) = write_transcript(&dir, "t9.jsonl", &[]);
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&t, None);
+    adapter.add_tracked_file(&t, None).unwrap();
 
     // Placeholder: large provisional input, cache fields MISSING.
     append_line(
@@ -448,7 +449,7 @@ fn cl9_placeholder_to_final() {
             Some(0),
         ),
     );
-    let stats = adapter.poll(&mut engine).unwrap();
+    let stats = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(stats.placeholders, 1);
     assert_eq!(stats.authoritative_finals, 1);
     let ledger = claude_ledger(&engine, "s1", "m1").expect("ledger");
@@ -476,7 +477,7 @@ fn cl10_changed_final_rewrite() {
     let dir = temp_dir();
     let (path, t) = write_transcript(&dir, "t10.jsonl", &[]);
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&t, None);
+    adapter.add_tracked_file(&t, None).unwrap();
     append_line(
         &path,
         &assistant_line(
@@ -491,7 +492,7 @@ fn cl10_changed_final_rewrite() {
             Some(0),
         ),
     );
-    let stats1 = adapter.poll(&mut engine).unwrap();
+    let stats1 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(stats1.authoritative_finals, 1);
     assert_eq!(stats1.changed_final_rewrites, 0);
 
@@ -510,7 +511,7 @@ fn cl10_changed_final_rewrite() {
             Some(0),
         ),
     );
-    let stats2 = adapter.poll(&mut engine).unwrap();
+    let stats2 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(
         stats2.changed_final_rewrites, 1,
         "health counter must increment"
@@ -535,7 +536,7 @@ fn cl11_exact_correlation() {
     let dir = temp_dir();
     let (path, t) = write_transcript(&dir, "t11.jsonl", &[]);
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&t, None);
+    adapter.add_tracked_file(&t, None).unwrap();
     append_line(
         &path,
         &assistant_line(
@@ -564,7 +565,7 @@ fn cl11_exact_correlation() {
             Some(0),
         ),
     );
-    adapter.poll(&mut engine).unwrap();
+    adapter.poll(&mut engine, &test_obs()).unwrap();
     let l1 = claude_ledger(&engine, "s1", "m1").expect("ledger m1");
     let l2 = claude_ledger(&engine, "s1", "m2").expect("ledger m2");
     assert_eq!(l1.canonical_output_total, 100);
@@ -587,7 +588,7 @@ fn cl12_uuid_unstable() {
     let dir = temp_dir();
     let (path, t) = write_transcript(&dir, "t12.jsonl", &[]);
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&t, None);
+    adapter.add_tracked_file(&t, None).unwrap();
     // Same message.id written 3 times with DIFFERENT line uuids + same values.
     for i in 0..3 {
         append_line(
@@ -605,7 +606,7 @@ fn cl12_uuid_unstable() {
             ),
         );
     }
-    let stats = adapter.poll(&mut engine).unwrap();
+    let stats = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(
         stats.authoritative_finals, 1,
         "uuid must NOT split one message"
@@ -642,9 +643,9 @@ fn cl13_cross_file_same_message() {
     append_line(&path_b, &line);
 
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&t_a, None);
-    adapter.add_tracked_file(&t_b, None);
-    let stats = adapter.poll(&mut engine).unwrap();
+    adapter.add_tracked_file(&t_a, None).unwrap();
+    adapter.add_tracked_file(&t_b, None).unwrap();
+    let stats = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(
         stats.authoritative_finals, 1,
         "cross-file same message counted once"
@@ -667,8 +668,8 @@ fn cl14_same_session_multi_file() {
     let (path_a, t_a) = write_transcript(&dir, "t14a.jsonl", &[]);
     let (path_b, t_b) = write_transcript(&dir, "t14b.jsonl", &[]);
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&t_a, None);
-    adapter.add_tracked_file(&t_b, None);
+    adapter.add_tracked_file(&t_a, None).unwrap();
+    adapter.add_tracked_file(&t_b, None).unwrap();
     append_line(
         &path_a,
         &assistant_line(
@@ -697,7 +698,7 @@ fn cl14_same_session_multi_file() {
             Some(0),
         ),
     );
-    adapter.poll(&mut engine).unwrap();
+    adapter.poll(&mut engine, &test_obs()).unwrap();
     let l1 = claude_ledger(&engine, "s1", "m1").expect("ledger m1");
     let l2 = claude_ledger(&engine, "s1", "m2").expect("ledger m2");
     assert_eq!(
@@ -730,9 +731,9 @@ fn cl15_initial_existing_attach() {
     );
     let (path, t) = write_transcript(&dir, "t15.jsonl", &[history]);
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&t, None); // first attach, file already has history
+    adapter.add_tracked_file(&t, None).unwrap(); // first attach, file already has history
 
-    let stats1 = adapter.poll(&mut engine).unwrap();
+    let stats1 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(
         stats1.authoritative_finals, 0,
         "history must NOT be imported at attach"
@@ -757,7 +758,7 @@ fn cl15_initial_existing_attach() {
             Some(0),
         ),
     );
-    let stats2 = adapter.poll(&mut engine).unwrap();
+    let stats2 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(stats2.authoritative_finals, 1);
     let ledger = claude_ledger(&engine, "s1", "mNew").expect("new ledger");
     assert_eq!(ledger.canonical_output_total, 50, "only +50 counted");
@@ -818,7 +819,7 @@ fn cl16_runtime_new_file() {
         1,
         "runtime new file discovered"
     );
-    let stats = adapter.poll(&mut engine).unwrap();
+    let stats = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(stats.authoritative_finals, 2);
     let l1 = claude_ledger(&engine, "s1", "m1").expect("m1");
     let l2 = claude_ledger(&engine, "s1", "m2").expect("m2");
@@ -848,7 +849,7 @@ fn cl17_durable_restart() {
         let storage = Arc::new(Mutex::new(StorageManager::new_file(&db_path).unwrap()));
         let mut engine = EnginePipeline::new("claude_run1", storage.clone()).unwrap();
         let mut adapter = make_adapter();
-        adapter.add_tracked_file(&t, None);
+        adapter.add_tracked_file(&t, None).unwrap();
         append_line(
             &path,
             &assistant_line(
@@ -863,7 +864,7 @@ fn cl17_durable_restart() {
                 Some(0),
             ),
         );
-        adapter.poll(&mut engine).unwrap();
+        adapter.poll(&mut engine, &test_obs()).unwrap();
         let ledger = claude_ledger(&engine, "s1", "m1").expect("run1 ledger");
         assert_eq!(ledger.canonical_output_total, 100);
         let cps = storage.lock().load_checkpoints().unwrap();
@@ -885,8 +886,8 @@ fn cl17_durable_restart() {
             .find(|c| c.source_id == source_id)
             .expect("run2 loads persisted checkpoint");
         let mut adapter = make_adapter();
-        adapter.add_tracked_file(&t, Some(cp));
-        adapter.poll(&mut engine).unwrap(); // nothing new yet
+        adapter.add_tracked_file(&t, Some(cp)).unwrap();
+        adapter.poll(&mut engine, &test_obs()).unwrap(); // nothing new yet
 
         append_line(
             &path,
@@ -902,7 +903,7 @@ fn cl17_durable_restart() {
                 Some(0),
             ),
         );
-        let stats = adapter.poll(&mut engine).unwrap();
+        let stats = adapter.poll(&mut engine, &test_obs()).unwrap();
         assert_eq!(stats.authoritative_finals, 1);
         let l1 = claude_ledger(&engine, "s1", "m1").expect("restored m1");
         let l2 = claude_ledger(&engine, "s1", "m2").expect("new m2");
@@ -949,9 +950,9 @@ fn cl18_duplicate_after_restart() {
         let storage = Arc::new(Mutex::new(StorageManager::new_file(&db_path).unwrap()));
         let mut engine = EnginePipeline::new("claude_run1", storage.clone()).unwrap();
         let mut adapter = make_adapter();
-        adapter.add_tracked_file(&t, None);
+        adapter.add_tracked_file(&t, None).unwrap();
         append_line(&path, &line);
-        adapter.poll(&mut engine).unwrap();
+        adapter.poll(&mut engine, &test_obs()).unwrap();
     }
 
     // Run 2: file appends an identical re-emit of M1 AFTER the checkpoint.
@@ -966,10 +967,10 @@ fn cl18_duplicate_after_restart() {
             .find(|c| c.source_id == source_id)
             .expect("checkpoint restored");
         let mut adapter = make_adapter();
-        adapter.add_tracked_file(&t, Some(cp));
+        adapter.add_tracked_file(&t, Some(cp)).unwrap();
         append_line(&path, &line); // re-emit appended after checkpoint
 
-        let stats = adapter.poll(&mut engine).unwrap();
+        let stats = adapter.poll(&mut engine, &test_obs()).unwrap();
         assert_eq!(
             stats.identical_reemit_dedup, 1,
             "post-restart re-emit deduped to checkpoint-only"
@@ -1010,8 +1011,8 @@ fn cl19_partial_eof() {
     let line1_len = (complete.len() + 1) as u64;
 
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&t, None);
-    let stats1 = adapter.poll(&mut engine).unwrap();
+    adapter.add_tracked_file(&t, None).unwrap();
+    let stats1 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(
         stats1.authoritative_finals, 0,
         "attach history (m1) not imported (§18); partial (m2) not complete"
@@ -1033,12 +1034,12 @@ fn cl19_partial_eof() {
         br#","cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
     );
     append_partial(&path, b"\n");
-    let stats2 = adapter.poll(&mut engine).unwrap();
+    let stats2 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(
         stats2.authoritative_finals, 1,
         "completed partial counted once"
     );
-    let stats3 = adapter.poll(&mut engine).unwrap();
+    let stats3 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(stats3.authoritative_finals, 0, "no double processing");
     let ledger = claude_ledger(&engine, "s1", "m2").expect("m2 ledger");
     assert_eq!(ledger.canonical_output_total, 50);
@@ -1056,7 +1057,7 @@ fn cl20_turnexact_no_fake_tps() {
     let dir = temp_dir();
     let (path, t) = write_transcript(&dir, "t20.jsonl", &[]);
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&t, None);
+    adapter.add_tracked_file(&t, None).unwrap();
     append_line(
         &path,
         &assistant_line(
@@ -1071,7 +1072,7 @@ fn cl20_turnexact_no_fake_tps() {
             Some(0),
         ),
     );
-    adapter.poll(&mut engine).unwrap();
+    adapter.poll(&mut engine, &test_obs()).unwrap();
 
     let metrics =
         engine
@@ -1117,7 +1118,7 @@ fn cl21_storage_fatal_halt() {
 
     let (path, t) = write_transcript(&dir, "t21.jsonl", &[]);
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&t, None);
+    adapter.add_tracked_file(&t, None).unwrap();
     append_line(
         &path,
         &assistant_line(
@@ -1134,12 +1135,12 @@ fn cl21_storage_fatal_halt() {
     );
 
     // First durable write (initial attach checkpoint) fails -> CheckpointPersist + fatal halt.
-    let err = adapter.poll(&mut engine).unwrap_err();
+    let err = adapter.poll(&mut engine, &test_obs()).unwrap_err();
     assert!(
         matches!(err, ClaudeAdapterError::CheckpointPersist),
         "expected CheckpointPersist, got {err:?}"
     );
-    let err2 = adapter.poll(&mut engine).unwrap_err();
+    let err2 = adapter.poll(&mut engine, &test_obs()).unwrap_err();
     assert!(
         matches!(err2, ClaudeAdapterError::FatalNeedsEngineRestart),
         "second poll must return Fatal: {err2:?}"
@@ -1163,7 +1164,7 @@ fn cl22_model_pass_through() {
     let dir = temp_dir();
     let (path, t) = write_transcript(&dir, "t22.jsonl", &[]);
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&t, None);
+    adapter.add_tracked_file(&t, None).unwrap();
     append_line(
         &path,
         &assistant_line(
@@ -1192,7 +1193,7 @@ fn cl22_model_pass_through() {
             Some(0),
         ),
     );
-    adapter.poll(&mut engine).unwrap();
+    adapter.poll(&mut engine, &test_obs()).unwrap();
     let l1 = claude_ledger(&engine, "s1", "m1").expect("m1");
     let l2 = claude_ledger(&engine, "s1", "m2").expect("m2");
     assert_eq!(
@@ -1230,6 +1231,7 @@ fn _build_ref() {
             finality: ClaudeUsageFinality::Placeholder,
         },
         0,
+        &test_obs(),
     );
     let _ = claude_semantics_ref();
 }
@@ -1237,4 +1239,199 @@ fn _build_ref() {
 #[allow(dead_code)]
 fn claude_semantics_ref() -> UsageSemantics {
     ai_token_flow_monitor_lib::adapters::claude::claude_semantics()
+}
+
+/// Deterministic synthetic observation (Task 03A §7): tests never create adapter-local clocks.
+fn test_obs() -> ObservationTime {
+    ObservationTime {
+        monotonic_ns: 1_000_000_000,
+        wall_timestamp_ms: 1_700_000_000_000,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CL23 Initial Attach Read Failure Retry
+// ---------------------------------------------------------------------------
+
+/// Hold an exclusive Windows handle (deny all sharing) so `std::fs::read` fails while
+/// `std::fs::metadata` still succeeds — a transient source read failure (03A-FIX §15).
+#[cfg(windows)]
+fn make_unreadable(path: &Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(path)
+        .unwrap()
+}
+
+#[test]
+fn cl23_initial_attach_read_failure_retry() {
+    let (mut engine, _) = make_pipeline();
+    let dir = temp_dir();
+    let history = assistant_line(
+        "2026-07-29T09:00:00.000Z",
+        "s1",
+        "mOld",
+        "uuid-old",
+        "model-a",
+        1000,
+        5000,
+        Some(0),
+        Some(0),
+    );
+    let (path, _t) = write_transcript(&dir, "t-cl23.jsonl", std::slice::from_ref(&history));
+
+    // First Initial Attach: file unreadable -> Safe EOF scan fails -> NOT attached (pending).
+    let guard = make_unreadable(&path);
+    let mut adapter = ClaudeAdapter::with_discovery(
+        ClaudeAdapterConfig {
+            tail_poll_interval: Duration::from_millis(1),
+            discovery_interval: Duration::ZERO,
+        },
+        ClaudeDiscovery::with_projects_root(dir.clone()),
+    );
+    adapter.refresh_discovery(&mut engine).unwrap();
+    assert_eq!(
+        adapter.tracked_count(),
+        0,
+        "must not attach / must not checkpoint=0 on read failure"
+    );
+    drop(guard);
+
+    // Restore readability: retry MUST use Existing Attach (history 5000 -> Live 0).
+    adapter.refresh_discovery(&mut engine).unwrap();
+    assert_eq!(adapter.tracked_count(), 1);
+    let stats1 = adapter.poll(&mut engine, &test_obs()).unwrap();
+    assert_eq!(
+        stats1.authoritative_finals, 0,
+        "history must NOT be imported"
+    );
+    assert!(claude_ledger(&engine, "s1", "mOld").is_none());
+
+    // New message output=50 -> +50 only.
+    append_line(
+        &path,
+        &assistant_line(
+            "2026-07-29T09:10:00.000Z",
+            "s1",
+            "mNew",
+            "uuid-new",
+            "model-a",
+            1000,
+            50,
+            Some(0),
+            Some(0),
+        ),
+    );
+    let stats2 = adapter.poll(&mut engine, &test_obs()).unwrap();
+    assert_eq!(stats2.authoritative_finals, 1);
+    let ledger = claude_ledger(&engine, "s1", "mNew").expect("new ledger");
+    assert_eq!(ledger.canonical_output_total, 50);
+    println!("CLAUDE INITIAL READ RETRY SAFETY = PASS");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// CL24 Transient Source Failure (no reset, no history replay)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cl24_transient_source_failure() {
+    let (mut engine, storage) = make_pipeline();
+    let dir = temp_dir();
+    let (path, t) = write_transcript(&dir, "t-cl24.jsonl", &[]);
+    let mut adapter = make_adapter();
+    adapter.add_tracked_file(&t, None).unwrap();
+    append_line(
+        &path,
+        &assistant_line(
+            "2026-07-29T09:00:00.000Z",
+            "s1",
+            "m1",
+            "uuid-1",
+            "model-a",
+            1000,
+            100,
+            Some(0),
+            Some(0),
+        ),
+    );
+    adapter.poll(&mut engine, &test_obs()).unwrap();
+    assert_eq!(
+        claude_ledger(&engine, "s1", "m1")
+            .unwrap()
+            .canonical_output_total,
+        100
+    );
+
+    let cp_before = {
+        let cps = storage.lock().load_checkpoints().unwrap();
+        cps.iter()
+            .find(|c| c.source_id == format!("claude_transcript_{}", t.file_hash))
+            .cloned()
+            .expect("checkpoint exists")
+    };
+
+    // New bytes exist so the poll must OPEN the file, then the read fails.
+    append_line(
+        &path,
+        &assistant_line(
+            "2026-07-29T09:10:00.000Z",
+            "s1",
+            "m2",
+            "uuid-2",
+            "model-a",
+            1000,
+            50,
+            Some(0),
+            Some(0),
+        ),
+    );
+
+    // Transient metadata-OK / read-fail: no reset to 0, no history replay.
+    let guard = make_unreadable(&path);
+    let stats = adapter.poll(&mut engine, &test_obs()).unwrap();
+    assert!(
+        stats.source_read_failures >= 1,
+        "read failure must be counted"
+    );
+    assert!(stats.sources_available >= 1);
+    assert_eq!(stats.authoritative_finals, 0);
+    assert_eq!(
+        claude_ledger(&engine, "s1", "m1")
+            .unwrap()
+            .canonical_output_total,
+        100
+    );
+    let cp_during = {
+        let cps = storage.lock().load_checkpoints().unwrap();
+        cps.iter()
+            .find(|c| c.source_id == format!("claude_transcript_{}", t.file_hash))
+            .cloned()
+            .expect("checkpoint exists")
+    };
+    assert_eq!(
+        cp_before.last_file_offset, cp_during.last_file_offset,
+        "checkpoint unchanged (no reset to 0)"
+    );
+    drop(guard);
+
+    // Restore: the pending m2 line is read -> total 150, no replay.
+    let stats2 = adapter.poll(&mut engine, &test_obs()).unwrap();
+    assert_eq!(stats2.authoritative_finals, 1);
+    assert_eq!(
+        claude_ledger(&engine, "s1", "m1")
+            .unwrap()
+            .canonical_output_total,
+        100
+    );
+    assert_eq!(
+        claude_ledger(&engine, "s1", "m2")
+            .unwrap()
+            .canonical_output_total,
+        50
+    );
+    println!("CLAUDE TRANSIENT SOURCE FAILURE = PASS");
+    let _ = std::fs::remove_dir_all(&dir);
 }

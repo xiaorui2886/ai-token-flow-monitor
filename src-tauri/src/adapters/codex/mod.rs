@@ -2,12 +2,12 @@ pub mod discovery;
 pub mod parser;
 pub mod tailer;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::adapters::common::jsonl::scan_safe_eof;
+use crate::adapters::common::jsonl::{read_file, scan_safe_eof, JsonlSourceReadError};
 use crate::core::types::ProcessOutcome;
 use crate::core::types::{
     BaselineMode, EngineError, EventKind, MeasurementKind, RawSourceSample, RawUsage,
@@ -15,6 +15,7 @@ use crate::core::types::{
     TokenAccuracy, UsageAccountingStrategy, UsageSemantics,
 };
 use crate::core::EnginePipeline;
+use crate::runtime::types::ObservationTime;
 
 use discovery::{CodexDiscovery, DiscoveredRollout};
 use parser::{parse_rollout_line, CodexTokenSnapshot};
@@ -28,13 +29,6 @@ pub const CODEX_MODEL_UNKNOWN: &str = "unknown";
 /// Internal canonical aggregation bucket for a rollout file (NOT a native Codex request id).
 pub const CODEX_LOGICAL_REQUEST_ID: &str = "session_cumulative";
 
-static ADAPTER_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-
-fn monotonic_now_ns() -> u64 {
-    let start = *ADAPTER_START.get_or_init(Instant::now);
-    start.elapsed().as_nanos() as u64
-}
-
 /// Frozen Ground Truth semantics for Codex rollout JSONL.
 pub fn codex_semantics() -> UsageSemantics {
     UsageSemantics {
@@ -46,6 +40,8 @@ pub fn codex_semantics() -> UsageSemantics {
 
 /// Build a RawSourceSample for one token_count record.
 /// - cumulative snapshot, no identity guessing, no fake IN timing.
+/// - `observation` comes from the runtime SHARED CollectorClock (Task 03A §6) — the adapter
+///   never creates its own time axis.
 pub fn build_snapshot_sample(
     file_hash: &str,
     session_id: &str,
@@ -53,14 +49,15 @@ pub fn build_snapshot_sample(
     snapshot: &CodexTokenSnapshot,
     line_start_offset: u64,
     interval_ms: Option<u64>,
+    observation: &ObservationTime,
 ) -> RawSourceSample {
     RawSourceSample {
         sample_id: format!("codex_{}_{}", file_hash, line_start_offset),
         collector_run_id: collector_run_id.to_string(),
         source_adapter_id: format!("codex_rollout_{}", file_hash),
         source_type: SourceType::JSONL,
-        observed_monotonic_ns: monotonic_now_ns(),
-        wall_timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        observed_monotonic_ns: observation.monotonic_ns,
+        wall_timestamp_ms: observation.wall_timestamp_ms,
         source_timestamp_ms: snapshot.source_timestamp_ms,
         process_id: None,
         agent_id: CODEX_AGENT_ID.to_string(),
@@ -141,8 +138,8 @@ pub struct FileScanResult {
 /// A partial line at EOF is never included in `safe_complete_end_offset` — the tailer
 /// re-reads it from that offset once the line is completed by the next append.
 /// The Safe EOF position comes from the shared `common::jsonl::scan_safe_eof`.
-pub fn scan_file(path: &Path, end_offset: u64) -> FileScanResult {
-    let data = std::fs::read(path).unwrap_or_default();
+pub fn scan_file(path: &Path, end_offset: u64) -> Result<FileScanResult, JsonlSourceReadError> {
+    let data = read_file(path)?;
     let limit = (end_offset as usize).min(data.len());
     let mut last_snapshot: Option<(u64, CodexTokenSnapshot)> = None;
     let mut start = 0usize;
@@ -155,10 +152,10 @@ pub fn scan_file(path: &Path, end_offset: u64) -> FileScanResult {
             start = end;
         }
     }
-    FileScanResult {
+    Ok(FileScanResult {
         safe_complete_end_offset: scan_safe_eof(&data, limit),
         last_token_snapshot: last_snapshot,
-    }
+    })
 }
 
 /// Per-file state. NEVER shared between files (offsets, baselines, checkpoints, identity are per-file).
@@ -182,6 +179,10 @@ pub struct RolloutFileState {
 #[derive(Debug, Clone, Default)]
 pub struct PollStats {
     pub files_tracked: usize,
+    /// Files whose metadata was readable this poll (Task 03A-FIX §9).
+    pub sources_available: usize,
+    /// metadata/open/seek/read failures this poll.
+    pub source_read_failures: usize,
     pub token_records_consumed: usize,
     pub canonical_deltas: usize,
     pub validation_matches: u64,
@@ -201,6 +202,10 @@ pub struct CodexAdapter {
     last_discovery: Option<Instant>,
     /// True after the first `refresh_discovery()` completed: later new files are Runtime New Files.
     initial_discovery_complete: bool,
+    /// Task 03A-FIX §6: files already present at the FIRST discovery, keyed by file_hash.
+    /// They MUST keep Existing Attach semantics until their Initial Attach succeeds — a
+    /// transient read failure must never reclassify them as Runtime New Files.
+    pending_initial_sources: HashSet<String>,
     /// Set on any durable failure; the adapter must be dropped and recreated.
     fatal: Option<CodexAdapterError>,
 }
@@ -217,6 +222,7 @@ impl CodexAdapter {
             files: HashMap::new(),
             last_discovery: None,
             initial_discovery_complete: false,
+            pending_initial_sources: HashSet::new(),
             fatal: None,
         }
     }
@@ -264,27 +270,52 @@ impl CodexAdapter {
                 .iter()
                 .find(|c| c.source_id == format!("codex_rollout_{}", rollout.file_hash))
                 .cloned();
-            self.add_tracked_file(&rollout, cp);
-            added += 1;
+
+            if self.pending_initial_sources.contains(&rollout.file_hash) {
+                // Startup-existing file whose Initial Attach failed: MUST retry as Existing
+                // Attach (never Runtime New), even after the first discovery completed.
+                match self.add_tracked_file(&rollout, cp) {
+                    Ok(()) => {
+                        self.pending_initial_sources.remove(&rollout.file_hash);
+                        added += 1;
+                    }
+                    Err(_) => {
+                        // Source read failure: keep pending, retry next discovery (§4).
+                    }
+                }
+            } else if !self.initial_discovery_complete {
+                match self.add_tracked_file(&rollout, cp) {
+                    Ok(()) => added += 1,
+                    Err(_) => {
+                        // First discovery saw this file but it is temporarily unreadable:
+                        // classify it as a startup-existing source (pending), not Runtime New.
+                        self.pending_initial_sources
+                            .insert(rollout.file_hash.clone());
+                    }
+                }
+            } else {
+                // Runtime New File: content was produced after monitor start.
+                // Cannot fail (no scan in this path).
+                let _ = self.add_tracked_file(&rollout, cp);
+                added += 1;
+            }
         }
         self.initial_discovery_complete = true;
         Ok(added)
     }
 
     /// Track a rollout file.
-    /// - `existing_checkpoint` (from SQLite): restart attach — tail from checkpoint, warm-up the
-    ///   last complete token_count before it (ReplayRestore).
-    /// - no checkpoint + discovery already completed: Runtime New File — tail from 0, first record
-    ///   KnownZeroOrigin (usage generated after monitor start MUST be counted).
-    /// - no checkpoint + first discovery: Existing Attach — scan to Safe EOF (never `rollout.size`),
-    ///   warm-up last complete token_count, Safe EOF checkpoint persisted at first poll.
+    ///
+    /// A `JsonlSourceReadError` means the file is temporarily unreadable: the caller keeps it
+    /// pending with Existing Attach semantics and retries on the next discovery
+    /// (Task 03A-FIX §4/§6).
     pub fn add_tracked_file(
         &mut self,
         rollout: &DiscoveredRollout,
         existing_checkpoint: Option<SourceCheckpoint>,
-    ) {
+    ) -> Result<(), JsonlSourceReadError> {
         if self.files.contains_key(&rollout.file_hash) {
-            return;
+            return Ok(());
         }
         let source_adapter_id = format!("codex_rollout_{}", rollout.file_hash);
         let session_id = format!("codex_session_{}", rollout.file_hash);
@@ -294,7 +325,7 @@ impl CodexAdapter {
                 Some(mut cp) => {
                     // Restart attach: only the region BEFORE the checkpoint may be warm-up baseline.
                     let tail_start = cp.last_file_offset;
-                    let warmup = scan_file(&rollout.path, cp.last_file_offset).last_token_snapshot;
+                    let warmup = scan_file(&rollout.path, cp.last_file_offset)?.last_token_snapshot;
                     let mode = if warmup.is_some() {
                         BaselineMode::ContinuousEpoch
                     } else {
@@ -303,7 +334,9 @@ impl CodexAdapter {
                     cp.source_id = source_adapter_id.clone();
                     (cp, mode, warmup, tail_start, false)
                 }
-                None if self.initial_discovery_complete => {
+                None if self.initial_discovery_complete
+                    && !self.pending_initial_sources.contains(&rollout.file_hash) =>
+                {
                     // Runtime New File: nothing in the file predates the monitor.
                     let cp = SourceCheckpoint {
                         source_id: source_adapter_id.clone(),
@@ -317,7 +350,7 @@ impl CodexAdapter {
                 }
                 None => {
                     // Existing Attach: Safe EOF, never rollout.size (§1, §2).
-                    let scan = scan_file(&rollout.path, rollout.size);
+                    let scan = scan_file(&rollout.path, rollout.size)?;
                     let warmup = scan.last_token_snapshot;
                     let mode = if warmup.is_some() {
                         BaselineMode::ContinuousEpoch
@@ -361,11 +394,17 @@ impl CodexAdapter {
                 initial_attach_pending,
             },
         );
+        Ok(())
     }
 
     /// Poll all tracked files once and feed the engine.
+    /// `observation` comes from the runtime SHARED CollectorClock — never an adapter-local clock.
     /// On any durable failure the adapter halts permanently (drop + recreate required).
-    pub fn poll(&mut self, engine: &mut EnginePipeline) -> Result<PollStats, CodexAdapterError> {
+    pub fn poll(
+        &mut self,
+        engine: &mut EnginePipeline,
+        observation: &ObservationTime,
+    ) -> Result<PollStats, CodexAdapterError> {
         if self.fatal.is_some() {
             // §9: after a storage failure this adapter instance must not ingest anything more.
             return Err(CodexAdapterError::FatalNeedsEngineRestart);
@@ -375,7 +414,7 @@ impl CodexAdapter {
             ..Default::default()
         };
         for state in self.files.values_mut() {
-            if let Err(e) = Self::poll_file(state, engine, &mut stats) {
+            if let Err(e) = Self::poll_file(state, engine, observation, &mut stats) {
                 self.fatal = Some(e);
                 return Err(e);
             }
@@ -386,13 +425,38 @@ impl CodexAdapter {
     fn poll_file(
         state: &mut RolloutFileState,
         engine: &mut EnginePipeline,
+        observation: &ObservationTime,
         stats: &mut PollStats,
     ) -> Result<(), CodexAdapterError> {
-        let file_size = std::fs::metadata(&state.path).map(|m| m.len()).unwrap_or(0);
+        // Task 03A-FIX §7: a metadata failure is a SOURCE READ FAILURE — never file_size=0,
+        // never a truncate/reset, never state advancement. Retry next poll.
+        let file_size = match std::fs::metadata(&state.path) {
+            Ok(m) => m.len(),
+            Err(_) => {
+                stats.source_read_failures += 1;
+                eprintln!(
+                    "codex_adapter: source read failure (metadata) {}",
+                    state.source_adapter_id
+                );
+                return Ok(());
+            }
+        };
+        stats.sources_available += 1;
 
         // §3: Truncate / unexpected replacement -> Safe EOF scan. checkpoint=file_size is forbidden.
         if file_size < state.tailer.offset {
-            let scan = scan_file(&state.path, file_size);
+            // Task 03A-FIX §4: scan failure -> degraded, state untouched, retry next poll.
+            let scan = match scan_file(&state.path, file_size) {
+                Ok(sc) => sc,
+                Err(_) => {
+                    stats.source_read_failures += 1;
+                    eprintln!(
+                        "codex_adapter: source read failure (truncation scan) {}",
+                        state.source_adapter_id
+                    );
+                    return Ok(());
+                }
+            };
             state.tailer.reset(scan.safe_complete_end_offset);
             state.warmup_snapshot = scan.last_token_snapshot;
             state.last_token_source_ts_ms = state
@@ -424,6 +488,7 @@ impl CodexAdapter {
                 &warm_snap,
                 warm_offset,
                 None,
+                observation,
             );
             engine
                 .process_sample(&sample, &codex_semantics(), BaselineMode::ReplayRestore)
@@ -443,22 +508,41 @@ impl CodexAdapter {
         }
 
         // Tail new bytes (if any) and process complete records.
+        // Task 03A-FIX §8: open/seek/read failures leave checkpoint/tailer/baseline/ledger
+        // untouched; the failure is counted and the next poll retries.
         if file_size > state.tailer.offset {
             let mut file = match std::fs::File::open(&state.path) {
                 Ok(f) => f,
-                Err(_) => return Ok(()),
+                Err(_) => {
+                    stats.source_read_failures += 1;
+                    eprintln!(
+                        "codex_adapter: source read failure (open) {}",
+                        state.source_adapter_id
+                    );
+                    return Ok(());
+                }
             };
             if file.seek(SeekFrom::Start(state.tailer.offset)).is_err() {
+                stats.source_read_failures += 1;
+                eprintln!(
+                    "codex_adapter: source read failure (seek) {}",
+                    state.source_adapter_id
+                );
                 return Ok(());
             }
             let mut chunk = Vec::new();
             if file.read_to_end(&mut chunk).is_err() {
+                stats.source_read_failures += 1;
+                eprintln!(
+                    "codex_adapter: source read failure (read) {}",
+                    state.source_adapter_id
+                );
                 return Ok(());
             }
             let lines = state.tailer.feed(&chunk);
             // §13: one fatal record aborts the whole chunk — N+1/N+2 must NOT be processed.
             for line in lines {
-                Self::process_line(state, line, engine, stats)?;
+                Self::process_line(state, line, engine, observation, stats)?;
             }
         }
         Ok(())
@@ -480,6 +564,7 @@ impl CodexAdapter {
         state: &mut RolloutFileState,
         line: JsonlLine,
         engine: &mut EnginePipeline,
+        observation: &ObservationTime,
         stats: &mut PollStats,
     ) -> Result<(), CodexAdapterError> {
         match parse_rollout_line(&line.bytes) {
@@ -515,6 +600,7 @@ impl CodexAdapter {
                     &snapshot,
                     line.line_start_offset,
                     interval_ms,
+                    observation,
                 );
                 let mode = state.mode_for_next;
 

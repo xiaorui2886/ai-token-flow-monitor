@@ -13,6 +13,7 @@ use ai_token_flow_monitor_lib::adapters::codex::{
 use ai_token_flow_monitor_lib::core::persistence::StorageManager;
 use ai_token_flow_monitor_lib::core::types::*;
 use ai_token_flow_monitor_lib::core::EnginePipeline;
+use ai_token_flow_monitor_lib::runtime::types::ObservationTime;
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -167,13 +168,13 @@ fn c4_openai_accounting() {
     let dir = temp_dir();
     let (path, rollout) = write_rollout(&dir, "rollout-c4.jsonl", &[]);
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&rollout, None);
+    adapter.add_tracked_file(&rollout, None).unwrap();
 
     append_line(
         &path,
         &token_count_line("2026-07-29T09:36:20.281Z", 1000, 600, 100, 0, 100),
     );
-    adapter.poll(&mut engine).unwrap();
+    adapter.poll(&mut engine, &test_obs()).unwrap();
 
     // OpenAI style: Context=1000, Fresh=400, Output=100
     let key = RequestCorrelationKey {
@@ -199,7 +200,7 @@ fn c5_session_cumulative_delta() {
     let (path, rollout) = write_rollout(&dir, "rollout-c5.jsonl", &[]);
     let session_id = format!("codex_session_{}", rollout.file_hash);
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&rollout, None);
+    adapter.add_tracked_file(&rollout, None).unwrap();
 
     append_line(
         &path,
@@ -213,7 +214,7 @@ fn c5_session_cumulative_delta() {
         &path,
         &token_count_line("2026-07-29T09:41:00.000Z", 1000, 0, 196, 0, 36),
     );
-    adapter.poll(&mut engine).unwrap();
+    adapter.poll(&mut engine, &test_obs()).unwrap();
 
     assert_eq!(ledger_output(&engine, &session_id), 196);
     let _ = std::fs::remove_dir_all(&dir);
@@ -230,13 +231,13 @@ fn c6_duplicate_reemit() {
     let (path, rollout) = write_rollout(&dir, "rollout-c6.jsonl", &[]);
     let session_id = format!("codex_session_{}", rollout.file_hash);
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&rollout, None);
+    adapter.add_tracked_file(&rollout, None).unwrap();
 
     append_line(
         &path,
         &token_count_line("2026-07-29T09:36:20.281Z", 1000, 0, 196, 0, 196),
     );
-    let stats1 = adapter.poll(&mut engine).unwrap();
+    let stats1 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(stats1.canonical_deltas, 1);
 
     // Duplicate re-emit: same cumulative 196
@@ -244,7 +245,7 @@ fn c6_duplicate_reemit() {
         &path,
         &token_count_line("2026-07-29T09:37:00.000Z", 1000, 0, 196, 0, 196),
     );
-    let stats2 = adapter.poll(&mut engine).unwrap();
+    let stats2 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(
         stats2.canonical_deltas, 0,
         "Re-emit must produce NO canonical delta"
@@ -285,9 +286,9 @@ fn c7_existing_file_attach() {
     );
     let session_id = format!("codex_session_{}", rollout.file_hash);
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&rollout, None); // first attach, has history
+    adapter.add_tracked_file(&rollout, None).unwrap(); // first attach, has history
 
-    let stats1 = adapter.poll(&mut engine).unwrap();
+    let stats1 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(
         stats1.canonical_deltas, 0,
         "Attach history must NOT produce live delta"
@@ -303,7 +304,7 @@ fn c7_existing_file_attach() {
         &path,
         &token_count_line("2026-07-29T09:20:00.000Z", 1000, 0, 5050, 0, 50),
     );
-    let stats2 = adapter.poll(&mut engine).unwrap();
+    let stats2 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(stats2.canonical_deltas, 1);
     assert_eq!(
         ledger_output(&engine, &session_id),
@@ -327,12 +328,12 @@ fn c8_restart_checkpoint_warmup() {
     {
         let (mut engine, storage) = make_pipeline();
         let mut adapter = make_adapter();
-        adapter.add_tracked_file(&rollout, None);
+        adapter.add_tracked_file(&rollout, None).unwrap();
         append_line(
             &path,
             &token_count_line("2026-07-29T09:00:00.000Z", 1000, 0, 500, 0, 500),
         );
-        let stats = adapter.poll(&mut engine).unwrap();
+        let stats = adapter.poll(&mut engine, &test_obs()).unwrap();
         assert_eq!(stats.canonical_deltas, 1);
         assert_eq!(ledger_output(&engine, &session_id), 500);
         let _ = storage;
@@ -366,14 +367,14 @@ fn c8_restart_checkpoint_warmup() {
         };
 
         let mut adapter = make_adapter();
-        adapter.add_tracked_file(&rollout, cp);
-        adapter.poll(&mut engine).unwrap(); // warm-up ReplayRestore -> 0 delta
+        adapter.add_tracked_file(&rollout, cp).unwrap();
+        adapter.poll(&mut engine, &test_obs()).unwrap(); // warm-up ReplayRestore -> 0 delta
 
         append_line(
             &path,
             &token_count_line("2026-07-29T09:10:00.000Z", 1000, 0, 550, 0, 50),
         );
-        let stats = adapter.poll(&mut engine).unwrap();
+        let stats = adapter.poll(&mut engine, &test_obs()).unwrap();
         assert_eq!(stats.canonical_deltas, 1);
         assert_eq!(
             ledger_output(&engine, &session_id),
@@ -426,8 +427,8 @@ fn c10_multiple_rollout_isolation() {
     let session_b = format!("codex_session_{}", rollout_b.file_hash);
 
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&rollout_a, None);
-    adapter.add_tracked_file(&rollout_b, None);
+    adapter.add_tracked_file(&rollout_a, None).unwrap();
+    adapter.add_tracked_file(&rollout_b, None).unwrap();
 
     // File A: 100 -> 150
     append_line(
@@ -448,7 +449,7 @@ fn c10_multiple_rollout_isolation() {
         &token_count_line("2026-07-29T09:10:00.000Z", 1000, 0, 260, 0, 60),
     );
 
-    adapter.poll(&mut engine).unwrap();
+    adapter.poll(&mut engine, &test_obs()).unwrap();
 
     // Per-session ledgers must be isolated.
     assert_eq!(ledger_output(&engine, &session_a), 150);
@@ -473,7 +474,7 @@ fn c11_interval_timing() {
     let dir = temp_dir();
     let (path, rollout) = write_rollout(&dir, "rollout-c11.jsonl", &[]);
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&rollout, None);
+    adapter.add_tracked_file(&rollout, None).unwrap();
 
     // t=1000ms output=100 ; t=5000ms output=300 -> delta 200 over 4s
     append_line(
@@ -484,7 +485,7 @@ fn c11_interval_timing() {
         &path,
         &token_count_line("2026-07-29T09:00:05.000Z", 1000, 0, 300, 0, 200),
     );
-    adapter.poll(&mut engine).unwrap();
+    adapter.poll(&mut engine, &test_obs()).unwrap();
 
     let metrics =
         engine
@@ -513,7 +514,7 @@ fn c12_no_fake_in_tps() {
     let dir = temp_dir();
     let (path, rollout) = write_rollout(&dir, "rollout-c12.jsonl", &[]);
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&rollout, None);
+    adapter.add_tracked_file(&rollout, None).unwrap();
 
     // Input delta > 0 but no TTFT / prefill timing.
     append_line(
@@ -524,7 +525,7 @@ fn c12_no_fake_in_tps() {
         &path,
         &token_count_line("2026-07-29T09:00:05.000Z", 1200, 0, 120, 0, 20),
     );
-    adapter.poll(&mut engine).unwrap();
+    adapter.poll(&mut engine, &test_obs()).unwrap();
 
     let metrics =
         engine
@@ -553,7 +554,7 @@ fn c13_stable_identity_restart() {
         let storage = Arc::new(Mutex::new(StorageManager::new_file(&db_path).unwrap()));
         let mut engine = EnginePipeline::new("run_c13_1", storage).unwrap();
         let mut adapter = make_adapter();
-        adapter.add_tracked_file(&rollout, None);
+        adapter.add_tracked_file(&rollout, None).unwrap();
         append_line(
             &path,
             &token_count_line("2026-07-29T09:00:00.000Z", 1000, 0, 100, 0, 100),
@@ -562,7 +563,7 @@ fn c13_stable_identity_restart() {
             &path,
             &token_count_line("2026-07-29T09:10:00.000Z", 1000, 0, 196, 0, 96),
         );
-        let stats = adapter.poll(&mut engine).unwrap();
+        let stats = adapter.poll(&mut engine, &test_obs()).unwrap();
         assert_eq!(stats.canonical_deltas, 2);
         assert_eq!(ledger_output(&engine, &session_id), 196);
     }
@@ -582,8 +583,8 @@ fn c13_stable_identity_restart() {
             watermark_timestamp_ms: 0,
             updated_at_ms: 0,
         };
-        adapter.add_tracked_file(&rollout, Some(cp));
-        let stats = adapter.poll(&mut engine).unwrap();
+        adapter.add_tracked_file(&rollout, Some(cp)).unwrap();
+        let stats = adapter.poll(&mut engine, &test_obs()).unwrap();
         // Warm-up consumes the last snapshot (ReplayRestore, no delta); no NEW records exist.
         assert_eq!(stats.canonical_deltas, 0);
         let total = storage.lock().get_total_output_tokens("codex").unwrap();
@@ -603,7 +604,7 @@ fn c14_truncated_file_safe_recovery() {
     let (path, rollout) = write_rollout(&dir, "rollout-c14.jsonl", &[]);
     let session_id = format!("codex_session_{}", rollout.file_hash);
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&rollout, None);
+    adapter.add_tracked_file(&rollout, None).unwrap();
 
     // Grow the file: 100 -> 500 (checkpoint advances well past 1000 bytes)
     append_line(
@@ -614,7 +615,7 @@ fn c14_truncated_file_safe_recovery() {
         &path,
         &token_count_line("2026-07-29T09:10:00.000Z", 1000, 0, 500, 0, 400),
     );
-    let stats1 = adapter.poll(&mut engine).unwrap();
+    let stats1 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(stats1.canonical_deltas, 2);
     assert_eq!(ledger_output(&engine, &session_id), 500);
 
@@ -628,7 +629,7 @@ fn c14_truncated_file_safe_recovery() {
     )
     .unwrap();
 
-    let stats2 = adapter.poll(&mut engine).unwrap();
+    let stats2 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(
         stats2.canonical_deltas, 0,
         "Truncation must NOT produce a live delta / TPS spike"
@@ -661,7 +662,7 @@ fn c15_last_usage_validation_only() {
     let (path, rollout) = write_rollout(&dir, "rollout-c15.jsonl", &[]);
     let session_id = format!("codex_session_{}", rollout.file_hash);
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&rollout, None);
+    adapter.add_tracked_file(&rollout, None).unwrap();
 
     // Record 1: total 0 (baseline), last 0
     append_line(
@@ -673,7 +674,7 @@ fn c15_last_usage_validation_only() {
         &path,
         &token_count_line("2026-07-29T09:10:00.000Z", 1000, 0, 50, 0, 50),
     );
-    let stats = adapter.poll(&mut engine).unwrap();
+    let stats = adapter.poll(&mut engine, &test_obs()).unwrap();
 
     assert_eq!(stats.validation_matches, 1);
     assert_eq!(stats.validation_mismatches, 0);
@@ -705,9 +706,9 @@ fn c16_existing_attach_partial_eof() {
     let session_id = format!("codex_session_{}", rollout.file_hash);
     let source_id = format!("codex_rollout_{}", rollout.file_hash);
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&rollout, None);
+    adapter.add_tracked_file(&rollout, None).unwrap();
 
-    let stats1 = adapter.poll(&mut engine).unwrap();
+    let stats1 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(
         stats1.canonical_deltas, 0,
         "Attach must not produce a live delta"
@@ -740,7 +741,7 @@ fn c16_existing_attach_partial_eof() {
         br#","total_tokens":6050},"last_token_usage":{"input_tokens":1000,"output_tokens":50},"model_context_window":258400},"rate_limits":{}}}"#,
     );
     append_partial(&path, b"\n");
-    let stats2 = adapter.poll(&mut engine).unwrap();
+    let stats2 = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(stats2.canonical_deltas, 1);
     assert_eq!(
         ledger_output(&engine, &session_id),
@@ -786,7 +787,7 @@ fn c17_runtime_new_rollout_capture() {
     );
 
     let session_b = format!("codex_session_{}", stable_path_hash(&path_b));
-    let stats = adapter.poll(&mut engine).unwrap();
+    let stats = adapter.poll(&mut engine, &test_obs()).unwrap();
     assert_eq!(stats.canonical_deltas, 2);
     assert_eq!(
         ledger_output(&engine, &session_b),
@@ -815,12 +816,12 @@ fn c18_durable_restart_end_to_end() {
         let storage = Arc::new(Mutex::new(StorageManager::new_file(&db_path).unwrap()));
         let mut engine = EnginePipeline::new("codex_test_run1", storage.clone()).unwrap();
         let mut adapter = make_adapter();
-        adapter.add_tracked_file(&rollout, None);
+        adapter.add_tracked_file(&rollout, None).unwrap();
         append_line(
             &path,
             &token_count_line("2026-07-29T09:00:00.000Z", 1000, 0, 500, 0, 500),
         );
-        let stats = adapter.poll(&mut engine).unwrap();
+        let stats = adapter.poll(&mut engine, &test_obs()).unwrap();
         assert_eq!(stats.canonical_deltas, 1);
         assert_eq!(ledger_output(&engine, &session_id), 500);
 
@@ -862,8 +863,8 @@ fn c18_durable_restart_end_to_end() {
             .expect("run 2 must load the persisted checkpoint");
 
         let mut adapter = make_adapter();
-        adapter.add_tracked_file(&rollout, Some(cp));
-        let stats0 = adapter.poll(&mut engine).unwrap();
+        adapter.add_tracked_file(&rollout, Some(cp)).unwrap();
+        let stats0 = adapter.poll(&mut engine, &test_obs()).unwrap();
         assert_eq!(
             stats0.canonical_deltas, 0,
             "restart warm-up must not re-count history"
@@ -873,7 +874,7 @@ fn c18_durable_restart_end_to_end() {
             &path,
             &token_count_line("2026-07-29T09:10:00.000Z", 1000, 0, 550, 0, 50),
         );
-        let stats1 = adapter.poll(&mut engine).unwrap();
+        let stats1 = adapter.poll(&mut engine, &test_obs()).unwrap();
         assert_eq!(stats1.canonical_deltas, 1);
         assert_eq!(ledger_output(&engine, &session_id), 550);
 
@@ -939,8 +940,8 @@ fn c20_initial_attach_checkpoint_persist() {
     let source_id = format!("codex_rollout_{}", rollout.file_hash);
 
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&rollout, None);
-    let stats = adapter.poll(&mut engine).unwrap(); // no new token events
+    adapter.add_tracked_file(&rollout, None).unwrap();
+    let stats = adapter.poll(&mut engine, &test_obs()).unwrap(); // no new token events
     assert_eq!(stats.canonical_deltas, 0);
 
     let cps = storage.lock().load_checkpoints().unwrap();
@@ -995,7 +996,7 @@ fn c21_checkpoint_load_failure_fatal() {
         0,
         "nothing may be tracked with a broken checkpoint load"
     );
-    let err2 = adapter.poll(&mut engine).unwrap_err();
+    let err2 = adapter.poll(&mut engine, &test_obs()).unwrap_err();
     assert!(
         matches!(err2, CodexAdapterError::FatalNeedsEngineRestart),
         "adapter must halt after checkpoint load failure: {err2:?}"
@@ -1027,20 +1028,20 @@ fn c22_storage_failure_fatal_halt() {
 
     let (path, rollout) = write_rollout(&dir, "rollout-c22.jsonl", &[]);
     let mut adapter = make_adapter();
-    adapter.add_tracked_file(&rollout, None);
+    adapter.add_tracked_file(&rollout, None).unwrap();
     append_line(
         &path,
         &token_count_line("2026-07-29T09:00:00.000Z", 1000, 0, 100, 0, 100),
     );
 
     // First durable write (initial attach checkpoint) fails -> CheckpointPersist + fatal halt.
-    let err = adapter.poll(&mut engine).unwrap_err();
+    let err = adapter.poll(&mut engine, &test_obs()).unwrap_err();
     assert!(
         matches!(err, CodexAdapterError::CheckpointPersist),
         "expected CheckpointPersist, got {err:?}"
     );
     // Subsequent polls return Fatal directly; no further ingest.
-    let err2 = adapter.poll(&mut engine).unwrap_err();
+    let err2 = adapter.poll(&mut engine, &test_obs()).unwrap_err();
     assert!(
         matches!(err2, CodexAdapterError::FatalNeedsEngineRestart),
         "second poll must return Fatal: {err2:?}"
@@ -1091,6 +1092,149 @@ fn _build_ref() {
         },
         0,
         None,
+        &test_obs(),
     );
     let _ = codex_semantics();
+}
+
+/// Deterministic synthetic observation (Task 03A §7): tests never create adapter-local clocks.
+fn test_obs() -> ObservationTime {
+    ObservationTime {
+        monotonic_ns: 1_000_000_000,
+        wall_timestamp_ms: 1_700_000_000_000,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C23 Initial Attach Read Failure Retry
+// ---------------------------------------------------------------------------
+
+/// Hold an exclusive Windows handle (deny all sharing) so `std::fs::read` fails while
+/// `std::fs::metadata` still succeeds — a transient source read failure (03A-FIX §13).
+#[cfg(windows)]
+fn make_unreadable(path: &Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(path)
+        .unwrap()
+}
+
+#[test]
+fn c23_initial_attach_read_failure_retry() {
+    let (mut engine, _) = make_pipeline();
+    let dir = temp_dir();
+    let sessions = dir.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let line1 = token_count_line("2026-07-29T09:00:00.000Z", 1000, 0, 5000, 0, 5000);
+    let (path, rollout) =
+        write_rollout(&sessions, "rollout-c23.jsonl", std::slice::from_ref(&line1));
+
+    // First Initial Attach: file unreadable -> scan fails -> NOT attached (pending).
+    let guard = make_unreadable(&path);
+    let mut adapter = CodexAdapter::with_discovery(
+        CodexAdapterConfig {
+            tail_poll_interval: Duration::from_millis(1),
+            discovery_interval: Duration::ZERO,
+        },
+        CodexDiscovery::with_root(dir.clone()),
+    );
+    adapter.refresh_discovery(&mut engine).unwrap();
+    assert_eq!(
+        adapter.tracked_count(),
+        0,
+        "must not attach / must not build a checkpoint=0 on read failure"
+    );
+    drop(guard);
+
+    // Restore readability: retry MUST use Existing Attach (history 5000 -> Live 0).
+    adapter.refresh_discovery(&mut engine).unwrap();
+    assert_eq!(adapter.tracked_count(), 1);
+    let stats1 = adapter.poll(&mut engine, &test_obs()).unwrap();
+    assert_eq!(stats1.canonical_deltas, 0, "history must NOT be imported");
+
+    // Append 5050 -> only +50.
+    append_line(
+        &path,
+        &token_count_line("2026-07-29T09:10:00.000Z", 1000, 0, 5050, 0, 50),
+    );
+    let stats2 = adapter.poll(&mut engine, &test_obs()).unwrap();
+    assert_eq!(stats2.canonical_deltas, 1);
+    let session_id = format!("codex_session_{}", rollout.file_hash);
+    assert_eq!(ledger_output(&engine, &session_id), 50);
+    println!("CODEX INITIAL READ RETRY SAFETY = PASS");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// C24 Transient Source Failure (no truncate, no state change)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn c24_transient_source_failure() {
+    let (mut engine, storage) = make_pipeline();
+    let dir = temp_dir();
+    let (path, rollout) = write_rollout(&dir, "rollout-c24.jsonl", &[]);
+    let session_id = format!("codex_session_{}", rollout.file_hash);
+    let mut adapter = make_adapter();
+    adapter.add_tracked_file(&rollout, None).unwrap();
+    append_line(
+        &path,
+        &token_count_line("2026-07-29T09:00:00.000Z", 1000, 0, 100, 0, 100),
+    );
+    adapter.poll(&mut engine, &test_obs()).unwrap();
+    assert_eq!(ledger_output(&engine, &session_id), 100);
+
+    // Capture the durable checkpoint BEFORE the failure.
+    let cp_before = {
+        let cps = storage.lock().load_checkpoints().unwrap();
+        cps.iter()
+            .find(|c| c.source_id == format!("codex_rollout_{}", rollout.file_hash))
+            .cloned()
+            .expect("checkpoint exists")
+    };
+
+    // New bytes exist so the poll must OPEN the file, then the read fails.
+    append_line(
+        &path,
+        &token_count_line("2026-07-29T09:10:00.000Z", 1000, 0, 150, 0, 50),
+    );
+
+    // Transient metadata-OK / read-fail: no truncate, no state advancement.
+    let guard = make_unreadable(&path);
+    let stats = adapter.poll(&mut engine, &test_obs()).unwrap();
+    assert!(
+        stats.source_read_failures >= 1,
+        "read failure must be counted"
+    );
+    assert!(
+        stats.sources_available >= 1,
+        "metadata-visible file counts as available"
+    );
+    assert_eq!(stats.canonical_deltas, 0);
+    assert_eq!(ledger_output(&engine, &session_id), 100, "ledger unchanged");
+    let cp_during = {
+        let cps = storage.lock().load_checkpoints().unwrap();
+        cps.iter()
+            .find(|c| c.source_id == format!("codex_rollout_{}", rollout.file_hash))
+            .cloned()
+            .expect("checkpoint exists")
+    };
+    assert_eq!(
+        cp_before.last_file_offset, cp_during.last_file_offset,
+        "checkpoint offset unchanged (no truncate recovery)"
+    );
+    assert_eq!(
+        cp_before.watermark_timestamp_ms, cp_during.watermark_timestamp_ms,
+        "checkpoint watermark unchanged"
+    );
+    drop(guard);
+
+    // Restore: the pending 150 line is read -> +50 only (no re-read of history).
+    let stats2 = adapter.poll(&mut engine, &test_obs()).unwrap();
+    assert_eq!(stats2.canonical_deltas, 1);
+    assert_eq!(ledger_output(&engine, &session_id), 150);
+    println!("CODEX TRANSIENT SOURCE FAILURE = PASS");
+    let _ = std::fs::remove_dir_all(&dir);
 }

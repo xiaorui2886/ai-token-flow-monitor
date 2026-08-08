@@ -66,6 +66,17 @@ impl JsonlTailer {
     }
 }
 
+/// External JSONL source read failure. Task 03A-FIX §3: READ ERROR != EMPTY FILE —
+/// a failed read must NEVER degrade to "safe EOF = 0" (that would manufacture a
+/// wrong checkpoint and import history as new data).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonlSourceReadError {
+    /// File metadata (size) could not be read.
+    MetadataFailed,
+    /// File content could not be read (open/seek/read failure).
+    ReadFailed,
+}
+
 /// Scan `data[..limit]` and return the byte offset just after the LAST complete
 /// newline-terminated record. A partial line at EOF is never included, so the
 /// returned offset is always a safe checkpoint position.
@@ -80,9 +91,14 @@ pub fn scan_safe_eof(data: &[u8], limit: usize) -> u64 {
 }
 
 /// Read `[0, end_offset)` of `path` and return the Safe EOF offset.
-/// On read failure the file is treated as empty (offset 0) — callers re-try next poll.
-pub fn read_scan_safe_eof(path: &Path, end_offset: u64) -> u64 {
-    let data = std::fs::read(path).unwrap_or_default();
+/// A read failure is PROPAGATED (never treated as an empty file).
+pub fn read_scan_safe_eof(path: &Path, end_offset: u64) -> Result<u64, JsonlSourceReadError> {
+    let data = std::fs::read(path).map_err(|_| JsonlSourceReadError::ReadFailed)?;
     let limit = (end_offset as usize).min(data.len());
-    scan_safe_eof(&data, limit)
+    Ok(scan_safe_eof(&data, limit))
+}
+
+/// Read a whole file, propagating read failures.
+pub fn read_file(path: &Path) -> Result<Vec<u8>, JsonlSourceReadError> {
+    std::fs::read(path).map_err(|_| JsonlSourceReadError::ReadFailed)
 }

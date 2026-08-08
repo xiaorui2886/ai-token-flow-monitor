@@ -1,5 +1,6 @@
 pub mod adapters;
 pub mod core;
+pub mod runtime;
 
 pub fn run() {
     tauri::Builder::default()

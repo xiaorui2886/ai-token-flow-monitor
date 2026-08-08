@@ -13,6 +13,7 @@ use ai_token_flow_monitor_lib::adapters::codex::{build_snapshot_sample, codex_se
 use ai_token_flow_monitor_lib::core::persistence::StorageManager;
 use ai_token_flow_monitor_lib::core::types::{BaselineMode, ProcessOutcome};
 use ai_token_flow_monitor_lib::core::EnginePipeline;
+use ai_token_flow_monitor_lib::runtime::types::ObservationTime;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
@@ -92,6 +93,7 @@ fn validate_existing() {
                     &snap,
                     line.line_start_offset,
                     None,
+                    &probe_observation(),
                 );
                 let mode = if first {
                     BaselineMode::KnownZeroOrigin
@@ -124,6 +126,7 @@ fn validate_existing() {
                     &snap,
                     rec.line_start_offset,
                     None,
+                    &probe_observation(),
                 );
                 match engine2.process_sample(
                     &sample,
@@ -208,4 +211,12 @@ fn file_has_token_count(path: &std::path::Path) -> bool {
 #[allow(dead_code)]
 fn _hash_ref(p: &std::path::Path) -> String {
     stable_path_hash(p)
+}
+
+/// Synthetic observation for replay validation (passive; the probe never runs a live runtime).
+fn probe_observation() -> ObservationTime {
+    ObservationTime {
+        monotonic_ns: 1_000_000_000,
+        wall_timestamp_ms: 1_700_000_000_000,
+    }
 }

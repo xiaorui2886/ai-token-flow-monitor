@@ -2,13 +2,14 @@ pub mod discovery;
 pub mod parser;
 pub mod tailer;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::adapters::common::identity::stable_hash16;
-use crate::adapters::common::jsonl::{read_scan_safe_eof, JsonlLine, JsonlTailer};
+use crate::adapters::common::jsonl::read_scan_safe_eof;
+use crate::adapters::common::jsonl::{JsonlLine, JsonlSourceReadError, JsonlTailer};
 use crate::core::types::ProcessOutcome;
 use crate::core::types::{
     BaselineMode, EngineError, EventKind, MeasurementKind, RawSourceSample, RawUsage,
@@ -16,6 +17,7 @@ use crate::core::types::{
     TimingInfo, TokenAccuracy, UsageAccountingStrategy, UsageSemantics,
 };
 use crate::core::EnginePipeline;
+use crate::runtime::types::ObservationTime;
 
 use discovery::{ClaudeDiscovery, DiscoveredTranscript};
 use parser::{parse_claude_line, ClaudeUsageFinality, ClaudeUsageRecord};
@@ -26,13 +28,6 @@ pub const CLAUDE_AGENT_NAME: &str = "Claude Code";
 /// Source client / accounting surface — NOT a declaration of the upstream model provider.
 pub const CLAUDE_PROVIDER: &str = "claude_code";
 pub const CLAUDE_MODEL_UNKNOWN: &str = "unknown";
-
-static ADAPTER_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-
-fn monotonic_now_ns() -> u64 {
-    let start = *ADAPTER_START.get_or_init(Instant::now);
-    start.elapsed().as_nanos() as u64
-}
 
 /// Frozen Ground Truth semantics for Claude Code transcripts.
 pub fn claude_semantics() -> UsageSemantics {
@@ -54,11 +49,13 @@ pub fn claude_message_id(raw_message: &str) -> String {
 }
 
 /// Build the canonical RawSourceSample for an AuthoritativeFinal record (§12-§13).
+/// `observation` comes from the runtime SHARED CollectorClock (Task 03A §6).
 pub fn build_final_sample(
     file_hash: &str,
     collector_run_id: &str,
     record: &ClaudeUsageRecord,
     line_start_offset: u64,
+    observation: &ObservationTime,
 ) -> RawSourceSample {
     let session_id = record
         .session_id
@@ -76,8 +73,8 @@ pub fn build_final_sample(
         collector_run_id: collector_run_id.to_string(),
         source_adapter_id: format!("claude_transcript_{}", file_hash),
         source_type: SourceType::JSONL,
-        observed_monotonic_ns: monotonic_now_ns(),
-        wall_timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        observed_monotonic_ns: observation.monotonic_ns,
+        wall_timestamp_ms: observation.wall_timestamp_ms,
         source_timestamp_ms: record.source_timestamp_ms,
         process_id: None,
         agent_id: CLAUDE_AGENT_ID.to_string(),
@@ -147,6 +144,10 @@ pub enum ClaudeAdapterError {
 #[derive(Debug, Clone, Default)]
 pub struct ClaudePollStats {
     pub files_tracked: usize,
+    /// Files whose metadata was readable this poll (Task 03A-FIX §9).
+    pub sources_available: usize,
+    /// metadata/open/seek/read failures this poll.
+    pub source_read_failures: usize,
     pub token_records_consumed: usize,
     pub placeholders: u64,
     pub authoritative_finals: u64,
@@ -184,6 +185,9 @@ pub struct ClaudeAdapter {
     last_discovery: Option<Instant>,
     /// True after the first `refresh_discovery()` completed: later new files are Runtime New Files.
     initial_discovery_complete: bool,
+    /// Task 03A-FIX §6: files already present at the FIRST discovery, keyed by file_hash.
+    /// They MUST keep Existing Attach semantics until their Initial Attach succeeds.
+    pending_initial_sources: HashSet<String>,
     /// Set on any durable failure; the adapter must be dropped and recreated.
     fatal: Option<ClaudeAdapterError>,
 }
@@ -200,6 +204,7 @@ impl ClaudeAdapter {
             files: HashMap::new(),
             last_discovery: None,
             initial_discovery_complete: false,
+            pending_initial_sources: HashSet::new(),
             fatal: None,
         }
     }
@@ -243,26 +248,52 @@ impl ClaudeAdapter {
                 .iter()
                 .find(|c| c.source_id == format!("claude_transcript_{}", transcript.file_hash))
                 .cloned();
-            self.add_tracked_file(&transcript, cp);
-            added += 1;
+
+            if self.pending_initial_sources.contains(&transcript.file_hash) {
+                // Startup-existing file whose Initial Attach failed: MUST retry as Existing
+                // Attach (never Runtime New), even after the first discovery completed.
+                match self.add_tracked_file(&transcript, cp) {
+                    Ok(()) => {
+                        self.pending_initial_sources.remove(&transcript.file_hash);
+                        added += 1;
+                    }
+                    Err(_) => {
+                        // Source read failure: keep pending, retry next discovery (§5).
+                    }
+                }
+            } else if !self.initial_discovery_complete {
+                match self.add_tracked_file(&transcript, cp) {
+                    Ok(()) => added += 1,
+                    Err(_) => {
+                        // First discovery saw this file but it is temporarily unreadable:
+                        // classify it as a startup-existing source (pending), not Runtime New.
+                        self.pending_initial_sources
+                            .insert(transcript.file_hash.clone());
+                    }
+                }
+            } else {
+                // Runtime New File: content was produced after monitor start.
+                // Cannot fail (no scan in this path).
+                let _ = self.add_tracked_file(&transcript, cp);
+                added += 1;
+            }
         }
         self.initial_discovery_complete = true;
         Ok(added)
     }
 
     /// Track a transcript file.
-    /// - `existing_checkpoint` (SQLite): restart attach — tail from checkpoint, NO ReplayRestore
-    ///   (Claude usage is per-message Final NativeCounter, §20).
-    /// - no checkpoint + discovery completed: Runtime New File — tail from 0, capture everything.
-    /// - no checkpoint + first discovery: Existing Attach — Safe EOF checkpoint, tail from Safe EOF,
-    ///   NO historical usage import (§18).
+    ///
+    /// A `JsonlSourceReadError` means the file is temporarily unreadable: the caller keeps it
+    /// pending with Existing Attach semantics and retries on the next discovery
+    /// (Task 03A-FIX §5/§6).
     pub fn add_tracked_file(
         &mut self,
         transcript: &DiscoveredTranscript,
         existing_checkpoint: Option<SourceCheckpoint>,
-    ) {
+    ) -> Result<(), JsonlSourceReadError> {
         if self.files.contains_key(&transcript.file_hash) {
-            return;
+            return Ok(());
         }
         let source_adapter_id = format!("claude_transcript_{}", transcript.file_hash);
 
@@ -272,7 +303,9 @@ impl ClaudeAdapter {
                 cp.source_id = source_adapter_id.clone();
                 (cp, tail_start, false)
             }
-            None if self.initial_discovery_complete => {
+            None if self.initial_discovery_complete
+                && !self.pending_initial_sources.contains(&transcript.file_hash) =>
+            {
                 let cp = SourceCheckpoint {
                     source_id: source_adapter_id.clone(),
                     last_file_offset: 0,
@@ -285,7 +318,9 @@ impl ClaudeAdapter {
             }
             None => {
                 // Existing Attach: Safe EOF only — never `transcript.size` (§23).
-                let safe_eof = read_scan_safe_eof(&transcript.path, transcript.size);
+                // A read failure is PROPAGATED: the file stays a Pending Existing Attach,
+                // never checkpoint=0 / tail-from-0 / Runtime New (§5).
+                let safe_eof = read_scan_safe_eof(&transcript.path, transcript.size)?;
                 let cp = SourceCheckpoint {
                     source_id: source_adapter_id.clone(),
                     last_file_offset: safe_eof,
@@ -309,12 +344,15 @@ impl ClaudeAdapter {
                 initial_attach_pending,
             },
         );
+        Ok(())
     }
 
     /// Poll all tracked files once and feed the engine.
+    /// `observation` comes from the runtime SHARED CollectorClock — never an adapter-local clock.
     pub fn poll(
         &mut self,
         engine: &mut EnginePipeline,
+        observation: &ObservationTime,
     ) -> Result<ClaudePollStats, ClaudeAdapterError> {
         if self.fatal.is_some() {
             return Err(ClaudeAdapterError::FatalNeedsEngineRestart);
@@ -324,7 +362,7 @@ impl ClaudeAdapter {
             ..Default::default()
         };
         for state in self.files.values_mut() {
-            if let Err(e) = Self::poll_file(state, engine, &mut stats) {
+            if let Err(e) = Self::poll_file(state, engine, observation, &mut stats) {
                 self.fatal = Some(e);
                 return Err(e);
             }
@@ -335,9 +373,23 @@ impl ClaudeAdapter {
     fn poll_file(
         state: &mut TranscriptFileState,
         engine: &mut EnginePipeline,
+        observation: &ObservationTime,
         stats: &mut ClaudePollStats,
     ) -> Result<(), ClaudeAdapterError> {
-        let file_size = std::fs::metadata(&state.path).map(|m| m.len()).unwrap_or(0);
+        // Task 03A-FIX §7: a metadata failure is a SOURCE READ FAILURE — never file_size=0,
+        // never a truncate/reset, never state advancement. Retry next poll.
+        let file_size = match std::fs::metadata(&state.path) {
+            Ok(m) => m.len(),
+            Err(_) => {
+                stats.source_read_failures += 1;
+                eprintln!(
+                    "claude_adapter: source read failure (metadata) {}",
+                    state.source_adapter_id
+                );
+                return Ok(());
+            }
+        };
+        stats.sources_available += 1;
 
         // §31: Truncate / replacement. Claude identity (sessionId+message.id) is exact, so a
         // full re-read from 0 is SAFE: placeholders stay ignored, already-finalized identical
@@ -358,21 +410,40 @@ impl ClaudeAdapter {
             Self::persist_checkpoint(&state.checkpoint, engine)?;
         }
 
+        // Task 03A-FIX §8: open/seek/read failures leave checkpoint/tailer/baseline/ledger
+        // untouched; the failure is counted and the next poll retries.
         if file_size > state.tailer.offset {
             let mut file = match std::fs::File::open(&state.path) {
                 Ok(f) => f,
-                Err(_) => return Ok(()),
+                Err(_) => {
+                    stats.source_read_failures += 1;
+                    eprintln!(
+                        "claude_adapter: source read failure (open) {}",
+                        state.source_adapter_id
+                    );
+                    return Ok(());
+                }
             };
             if file.seek(SeekFrom::Start(state.tailer.offset)).is_err() {
+                stats.source_read_failures += 1;
+                eprintln!(
+                    "claude_adapter: source read failure (seek) {}",
+                    state.source_adapter_id
+                );
                 return Ok(());
             }
             let mut chunk = Vec::new();
             if file.read_to_end(&mut chunk).is_err() {
+                stats.source_read_failures += 1;
+                eprintln!(
+                    "claude_adapter: source read failure (read) {}",
+                    state.source_adapter_id
+                );
                 return Ok(());
             }
             let lines = state.tailer.feed(&chunk);
             for line in lines {
-                Self::process_line(state, line, engine, stats)?;
+                Self::process_line(state, line, engine, observation, stats)?;
             }
         }
         Ok(())
@@ -394,6 +465,7 @@ impl ClaudeAdapter {
         state: &mut TranscriptFileState,
         line: JsonlLine,
         engine: &mut EnginePipeline,
+        observation: &ObservationTime,
         stats: &mut ClaudePollStats,
     ) -> Result<(), ClaudeAdapterError> {
         match parse_claude_line(&line.bytes) {
@@ -472,6 +544,7 @@ impl ClaudeAdapter {
                             &engine.collector_run_id,
                             &record,
                             line.line_start_offset,
+                            observation,
                         );
 
                         // §14: Final path -> Core authoritative reconciliation; BaselineMode is

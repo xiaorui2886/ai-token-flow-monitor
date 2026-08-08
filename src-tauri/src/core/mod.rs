@@ -114,9 +114,12 @@ impl EnginePipeline {
             model: sample.model.clone(),
             provider: sample.provider.clone(),
             flags: AgentRuntimeFlags {
+                // Task 03A-FIX §1: a usage observation proves a token was measured, NOT that the
+                // agent process is running or a request is active right now. Only a real
+                // Runtime/Process/Stream detector may set these in the future.
                 installed: true,
-                running: true,
-                request_active: true,
+                running: false,
+                request_active: false,
                 generating: false,
                 supported: true,
                 adapter_healthy: true,
