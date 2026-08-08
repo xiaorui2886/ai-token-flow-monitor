@@ -154,6 +154,17 @@ impl EnginePipeline {
                 return Err(EngineError::StorageError(e.to_string()));
             }
 
+            // Task 02F §25: record the EffectiveMeasured/PrefillExact IN metric ONLY AFTER the
+            // durable commit succeeded. A storage failure must never produce an IN metric.
+            // (TurnExact Final never enters Live OUT TPS — no buffer push here.)
+            self.tps_engine.record_input_measurement(
+                &sample.agent_id,
+                &sample.collector_run_id,
+                sample.observed_monotonic_ns,
+                normalized.normalized_context_input_tokens,
+                &sample.timing,
+            );
+
             return Ok(ProcessOutcome::Committed(Box::new(CommittedDetails {
                 delta: None,
                 correction,
