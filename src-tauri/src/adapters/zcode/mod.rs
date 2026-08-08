@@ -14,7 +14,7 @@ use crate::core::types::{
 use crate::core::EnginePipeline;
 
 use discovery::{DiscoveredZCodeDb, ZCodeDiscovery};
-use reader::{fetch_max_terminal_completed_at, fetch_rows, open_read_only};
+use reader::{fetch_max_terminal_completed_at, fetch_rows, open_read_only, ExternalReadError};
 use types::{is_terminal_status, ZCodeUsageRow};
 
 pub const ZCODE_SQLITE_PRIORITY: u8 = 50;
@@ -179,6 +179,20 @@ pub struct ZCodeDbState {
     pub initial_attach_pending: bool,
 }
 
+/// Startup classification of the external source (02F-FIX #1).
+/// An Initial Existing DB must NEVER degrade into a Runtime New Source just because a
+/// transient external read failed at attach time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitialSourceDiscoveryState {
+    /// First discovery has not completed successfully yet (or attach failed -> retry as
+    /// Initial Existing Attach on the next discovery).
+    Pending,
+    /// First discovery found NO db.sqlite: a DB appearing later is a Runtime New Source.
+    CompletedWithoutSource,
+    /// First discovery found db.sqlite and the Initial Existing Attach succeeded.
+    CompletedWithSource,
+}
+
 /// ZCode SQLite model_usage Adapter V1.
 /// Passive read only (SQLITE_OPEN_READ_ONLY). Canonical source: `model_usage` table only.
 /// Rollout JSONL = VALIDATION ONLY (never canonical); logs = ignored.
@@ -190,9 +204,9 @@ pub struct ZCodeAdapter {
     pub discovery: ZCodeDiscovery,
     db_state: Option<ZCodeDbState>,
     last_discovery: Option<Instant>,
-    /// True after the first `refresh_discovery()` completed: a DB appearing later is
-    /// a Runtime New Source (§16, watermark 0) instead of an Initial Attach (§15).
-    initial_discovery_complete: bool,
+    /// Startup classification (02F-FIX #1): a failed initial attach keeps `Pending`, so the
+    /// next discovery retries with Initial Existing Attach semantics — never Runtime New.
+    initial_source_state: InitialSourceDiscoveryState,
     fatal: Option<ZCodeAdapterError>,
 }
 
@@ -207,7 +221,7 @@ impl ZCodeAdapter {
             discovery,
             db_state: None,
             last_discovery: None,
-            initial_discovery_complete: false,
+            initial_source_state: InitialSourceDiscoveryState::Pending,
             fatal: None,
         }
     }
@@ -216,9 +230,14 @@ impl ZCodeAdapter {
         usize::from(self.db_state.is_some())
     }
 
-    /// Discover the primary DB and attach it.
-    /// - First completed refresh: Initial Attach (§15) — boundary = MAX terminal completed_at.
-    /// - DB found afterwards: Runtime New Source (§16) — boundary 0, everything counts.
+    /// Discover the primary DB and attach it (02F-FIX #1 state machine):
+    /// - First discovery finds NO db.sqlite -> `CompletedWithoutSource`; a DB appearing
+    ///   later is a Runtime New Source (§16, boundary 0).
+    /// - First discovery finds db.sqlite + successful Initial Attach -> `CompletedWithSource`
+    ///   (boundary = MAX terminal completed_at, §15).
+    /// - First discovery finds db.sqlite but the external open/query FAILS -> stay `Pending`;
+    ///   the next discovery MUST retry with Initial Existing Attach semantics. The old DB can
+    ///   never be re-classified as Runtime New (which would import all history).
     /// - Checkpoint load failure stops discovery (our storage -> fatal).
     pub fn refresh_discovery(
         &mut self,
@@ -243,21 +262,50 @@ impl ZCodeAdapter {
         };
 
         let mut added = 0;
-        if self.db_state.is_none() {
-            if let Some(db) = self.discovery.discover_db() {
-                let cp = checkpoints
-                    .iter()
-                    .find(|c| c.source_id == format!("zcode_model_usage_{}", db.db_hash))
-                    .cloned();
-                self.attach_db(&db, cp);
-                added = usize::from(self.db_state.is_some());
+        match self.discovery.discover_db() {
+            Some(db) => {
+                if self.db_state.is_none() {
+                    let cp = checkpoints
+                        .iter()
+                        .find(|c| c.source_id == format!("zcode_model_usage_{}", db.db_hash))
+                        .cloned();
+                    match self.attach_db(&db, cp) {
+                        Ok(()) => {
+                            if self.db_state.is_some() {
+                                added = 1;
+                                if self.initial_source_state == InitialSourceDiscoveryState::Pending
+                                {
+                                    // B: successful Initial Existing Attach completes startup.
+                                    self.initial_source_state =
+                                        InitialSourceDiscoveryState::CompletedWithSource;
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            // C: attach failed on a transient external read error. Stay
+                            // `Pending` — never downgrade to Runtime New Source semantics.
+                        }
+                    }
+                }
+            }
+            None => {
+                // A: no source at startup.
+                if self.initial_source_state == InitialSourceDiscoveryState::Pending {
+                    self.initial_source_state = InitialSourceDiscoveryState::CompletedWithoutSource;
+                }
             }
         }
-        self.initial_discovery_complete = true;
         Ok(added)
     }
 
-    fn attach_db(&mut self, db: &DiscoveredZCodeDb, existing_checkpoint: Option<SourceCheckpoint>) {
+    /// Attach the primary DB. `Err(ExternalReadError)` means the external DB was seen by
+    /// metadata discovery but could not be opened/queried — the caller must keep the
+    /// startup classification `Pending` and retry (02F-FIX #1).
+    fn attach_db(
+        &mut self,
+        db: &DiscoveredZCodeDb,
+        existing_checkpoint: Option<SourceCheckpoint>,
+    ) -> Result<(), ExternalReadError> {
         let source_adapter_id = format!("zcode_model_usage_{}", db.db_hash);
         let (checkpoint, boundary, pending) = match existing_checkpoint {
             Some(mut cp) => {
@@ -266,7 +314,9 @@ impl ZCodeAdapter {
                 cp.source_id = source_adapter_id.clone();
                 (cp, boundary, false)
             }
-            None if self.initial_discovery_complete => {
+            None if self.initial_source_state
+                == InitialSourceDiscoveryState::CompletedWithoutSource =>
+            {
                 // Runtime New Source (§16): watermark 0, boundary 0 — all rows count.
                 let cp = SourceCheckpoint {
                     source_id: source_adapter_id.clone(),
@@ -279,16 +329,12 @@ impl ZCodeAdapter {
                 (cp, 0, false)
             }
             None => {
-                // Initial Attach (§15): MAX(completed_at) over terminal rows -> initial watermark.
-                // External read failure at attach: do not track; retry next discovery.
-                let conn = match open_read_only(&db.path) {
-                    Ok(c) => c,
-                    Err(_) => return,
-                };
-                let max_ts = match fetch_max_terminal_completed_at(&conn) {
-                    Ok(v) => v.unwrap_or(0),
-                    Err(_) => return,
-                };
+                // Initial Existing Attach (§15): MAX(completed_at) over terminal rows ->
+                // initial watermark + history boundary. A transient external failure is
+                // PROPAGATED (02F-FIX #1) — the caller keeps `Pending` and retries; the DB
+                // must never be re-classified as a Runtime New Source.
+                let conn = open_read_only(&db.path)?;
+                let max_ts = fetch_max_terminal_completed_at(&conn)?.unwrap_or(0);
                 let cp = SourceCheckpoint {
                     source_id: source_adapter_id.clone(),
                     last_file_offset: 0,
@@ -311,6 +357,7 @@ impl ZCodeAdapter {
             history_boundary_ms: boundary,
             initial_attach_pending: pending,
         });
+        Ok(())
     }
 
     /// Poll the external DB once and feed the engine.
@@ -375,8 +422,11 @@ impl ZCodeAdapter {
             // §11: only frozen terminal statuses are Authoritative Usage Finals.
             if !is_terminal_status(&row.status) {
                 stats.health_unknown_status += 1;
-                // §22: do NOT advance the watermark past a potential future-final row.
-                continue;
+                // 02F-FIX #3: unknown future status is a WATERMARK BARRIER. Stop processing
+                // subsequent rows — checkpoint/watermark stay before this row, the adapter is
+                // NOT fatal, and the next poll re-reads. If ZCode later updates this row to a
+                // terminal status it is still captured; it is never silently skipped past.
+                break;
             }
             stats.rows_consumed += 1;
 

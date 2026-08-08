@@ -1400,3 +1400,262 @@ fn _refs() {
         modified_ms: 0,
     };
 }
+
+// ---------------------------------------------------------------------------
+// ZC21 Startup Attach Retry Safety
+// ---------------------------------------------------------------------------
+
+#[test]
+fn zc21_startup_attach_retry_safety() {
+    let (mut engine, _) = make_pipeline();
+    let dir = temp_dir();
+    let db_path = cli_db_path(&dir);
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+    // 1-5: db.sqlite EXISTS at startup but is structurally broken (no model_usage table):
+    // metadata discovery succeeds, the initial attach query must FAIL and the adapter
+    // must NOT attach; the startup classification must stay Pending.
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("CREATE TABLE other_table (x INTEGER)")
+            .unwrap();
+    }
+    let mut adapter = adapter_for(&dir);
+    assert_eq!(
+        adapter.refresh_discovery(&mut engine).unwrap(),
+        0,
+        "broken-schema attach must fail without attaching"
+    );
+    assert_eq!(adapter.tracked_count(), 0, "no attach on broken schema");
+
+    // 8-9: fix the schema, insert one history Final (output 5000, completed_at 10000).
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        insert_row(
+            &conn,
+            "rOld",
+            "LOld",
+            "S1",
+            "T1",
+            "model-a",
+            "P1",
+            "completed",
+            1000,
+            None,
+            10000,
+            Some(10000),
+            Some(5000),
+            Some(0),
+            Some(0),
+            Some(0),
+        );
+    }
+
+    // 10: next refresh MUST use Initial Existing Attach semantics (boundary 10000),
+    // never Runtime New Source (which would import the 5000 history).
+    assert_eq!(
+        adapter.refresh_discovery(&mut engine).unwrap(),
+        1,
+        "retry attach succeeds"
+    );
+    let stats1 = adapter.poll(&mut engine).unwrap();
+    assert_eq!(
+        stats1.authoritative_finals, 0,
+        "history 5000 must NOT be imported"
+    );
+    assert!(
+        zcode_ledger(&engine, "S1", "LOld").is_none(),
+        "no canonical for pre-attach history"
+    );
+
+    // 12: new Final 50 at completed_at 11000 -> +50 only.
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        insert_row(
+            &conn,
+            "rNew",
+            "LNew",
+            "S1",
+            "T1",
+            "model-a",
+            "P1",
+            "completed",
+            10500,
+            None,
+            11000,
+            Some(1000),
+            Some(50),
+            Some(0),
+            Some(0),
+            Some(0),
+        );
+    }
+    let stats2 = adapter.poll(&mut engine).unwrap();
+    assert_eq!(stats2.authoritative_finals, 1);
+    let ledger = zcode_ledger(&engine, "S1", "LNew").expect("new ledger");
+    assert_eq!(ledger.canonical_output_total, 50);
+    println!("STARTUP ATTACH RETRY SAFETY = PASS");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// ZC22 Unknown Status Watermark Barrier
+// ---------------------------------------------------------------------------
+
+#[test]
+fn zc22_unknown_status_watermark_barrier() {
+    let (mut engine, _) = make_pipeline();
+    let dir = temp_dir();
+    let db_path = cli_db_path(&dir);
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let conn = create_external_db(&db_path);
+    drop(conn);
+    let mut adapter = adapter_for(&dir);
+    adapter.refresh_discovery(&mut engine).unwrap(); // empty DB -> boundary 0
+
+    // Runtime source: Row A unknown status at completed_at 2000; Row B completed at 3000.
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        insert_row(
+            &conn,
+            "rA",
+            "LA",
+            "S1",
+            "T1",
+            "model-a",
+            "P1",
+            "future_status",
+            1000,
+            None,
+            2000,
+            Some(1000),
+            Some(100),
+            Some(0),
+            Some(0),
+            Some(0),
+        );
+        insert_row(
+            &conn,
+            "rB",
+            "LB",
+            "S1",
+            "T1",
+            "model-a",
+            "P1",
+            "completed",
+            2500,
+            None,
+            3000,
+            Some(1000),
+            Some(60),
+            Some(0),
+            Some(0),
+            Some(0),
+        );
+    }
+
+    // First poll: A not counted; B must NOT be processed past the barrier; watermark stays
+    // before A; adapter NOT fatal.
+    let s1 = adapter.poll(&mut engine).unwrap();
+    assert_eq!(s1.health_unknown_status, 1);
+    assert_eq!(
+        s1.authoritative_finals, 0,
+        "B must wait behind the unknown row"
+    );
+    assert!(zcode_ledger(&engine, "S1", "LA").is_none());
+    assert!(zcode_ledger(&engine, "S1", "LB").is_none());
+
+    // UPDATE Row A -> completed; next poll captures BOTH (A must not be missed).
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE model_usage SET status='completed' WHERE id='rA'",
+            [],
+        )
+        .unwrap();
+    }
+    let s2 = adapter.poll(&mut engine).unwrap();
+    assert_eq!(s2.authoritative_finals, 2);
+    let la = zcode_ledger(&engine, "S1", "LA").unwrap();
+    let lb = zcode_ledger(&engine, "S1", "LB").unwrap();
+    assert_eq!(
+        la.canonical_output_total + lb.canonical_output_total,
+        160,
+        "A must not be missed"
+    );
+    println!("UNKNOWN STATUS WATERMARK BARRIER = PASS");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// ZC23 Final Metadata Reconciliation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn zc23_final_metadata_reconciliation() {
+    let (mut engine, _) = make_pipeline();
+    let dir = temp_dir();
+    let db_path = cli_db_path(&dir);
+    let mut adapter = adapter_for(&dir);
+    attach_and_seed(&mut engine, &mut adapter, &db_path, |conn| {
+        insert_row(
+            conn,
+            "r1",
+            "L1",
+            "S1",
+            "T1",
+            "model-a",
+            "provider-a",
+            "completed",
+            1000,
+            None,
+            2000,
+            Some(1000),
+            Some(100),
+            Some(0),
+            Some(0),
+            Some(0),
+        );
+    });
+    adapter.poll(&mut engine).unwrap();
+    let l = zcode_ledger(&engine, "S1", "L1").unwrap();
+    assert_eq!(
+        (
+            l.model.as_str(),
+            l.provider.as_str(),
+            l.canonical_output_total
+        ),
+        ("model-a", "provider-a", 100)
+    );
+
+    // Synthetic external UPDATE: model/provider only; token numbers identical.
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE model_usage SET model_id='model-b', provider_id='provider-b' WHERE id='r1'",
+            [],
+        )
+        .unwrap();
+    }
+
+    // Poll 1: metadata change -> one changed_final_rewrite; ledger metadata reconciled.
+    let s2 = adapter.poll(&mut engine).unwrap();
+    assert_eq!(
+        s2.changed_final_rewrites, 1,
+        "metadata change must reconcile once"
+    );
+    let l2 = zcode_ledger(&engine, "S1", "L1").unwrap();
+    assert_eq!(
+        (l2.model.as_str(), l2.provider.as_str()),
+        ("model-b", "provider-b")
+    );
+    assert_eq!(l2.canonical_output_total, 100, "token numbers unchanged");
+
+    // Poll 2: must converge to identical_final_dedup — never changed forever.
+    let s3 = adapter.poll(&mut engine).unwrap();
+    assert_eq!(s3.changed_final_rewrites, 0);
+    assert_eq!(s3.identical_final_dedup, 1);
+    println!("FINAL METADATA RECONCILIATION = PASS");
+    let _ = std::fs::remove_dir_all(&dir);
+}

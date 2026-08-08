@@ -168,6 +168,12 @@ impl RequestLedgerManager {
         entry.canonical_cache_write = target_c_write;
         entry.canonical_reasoning = target_reason;
 
+        // Task 02F-FIX #5: Authoritative Final reconciliation also updates model/provider
+        // metadata (a changed-final rewrite with identical token numbers must converge to
+        // identical_final_dedup, never stay "changed" forever). Token correction math untouched.
+        entry.model = sample.model.clone();
+        entry.provider = sample.provider.clone();
+
         let correction = if diff_ctx_in != 0
             || diff_fresh_in != 0
             || diff_out != 0
