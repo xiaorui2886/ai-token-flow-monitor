@@ -189,45 +189,49 @@ impl StopSignal {
 
 /// Shared, cheap-clone host state. The worker is the ONLY writer of `snapshot`;
 /// commands/frontend only read (`state`, `snapshot`, `fatal_kind`).
-struct SharedState {
+struct HostInner {
     /// (host state, sanitized fatal kind).
     state: Mutex<(RuntimeHostState, Option<String>)>,
     snapshot: RwLock<Option<RuntimePublicSnapshot>>,
     /// Single worker join handle; taken exactly once by `stop()` (idempotent join).
     join: Mutex<Option<JoinHandle<()>>>,
+    stop: StopSignal,
 }
 
 /// Cloneable handle managed by Tauri (`app.manage`). All methods are non-blocking except
 /// `stop()` which joins the worker (bounded: one tick at most).
+///
+/// `Drop` stops the worker ONLY when this is the last live handle (`strong_count == 1`):
+/// dropping the `RuntimeHost` at the end of Tauri `setup` must never kill a worker that
+/// the managed handle still points at.
 #[derive(Clone)]
 pub struct RuntimeHostHandle {
-    shared: Arc<SharedState>,
-    stop: Arc<StopSignal>,
+    inner: Arc<HostInner>,
 }
 
 impl RuntimeHostHandle {
     pub fn state(&self) -> RuntimeHostState {
-        self.shared.state.lock().0
+        self.inner.state.lock().0
     }
 
     /// Sanitized fatal kind (`monitor_storage` / `engine` / `adapter:<kind>`). Never a raw error.
     pub fn fatal_kind(&self) -> Option<String> {
-        self.shared.state.lock().1.clone()
+        self.inner.state.lock().1.clone()
     }
 
     pub fn snapshot(&self) -> Option<RuntimePublicSnapshot> {
-        self.shared.snapshot.read().clone()
+        self.inner.snapshot.read().clone()
     }
 
     /// Cooperative stop: request -> collector loop exits -> worker joins.
     /// Idempotent: repeated calls join nothing. Never panics, never double-joins.
     /// A `Fatal` host keeps its fatal state; otherwise the state becomes `Stopped`.
     pub fn stop(&self) {
-        self.stop.request();
-        if let Some(join) = self.shared.join.lock().take() {
+        self.inner.stop.request();
+        if let Some(join) = self.inner.join.lock().take() {
             let _ = join.join();
         }
-        let mut state = self.shared.state.lock();
+        let mut state = self.inner.state.lock();
         if state.0 != RuntimeHostState::Fatal {
             state.0 = RuntimeHostState::Stopped;
         }
@@ -237,8 +241,11 @@ impl RuntimeHostHandle {
 impl Drop for RuntimeHostHandle {
     fn drop(&mut self) {
         // Drop fallback: the normal shutdown path (RunEvent::Exit) already called stop();
-        // this only prevents a leaked worker when that path was never reached.
-        self.stop();
+        // this only prevents a leaked worker when that path was never reached. Multiple
+        // live handles (host + managed) share one Arc — only the last one stops.
+        if Arc::strong_count(&self.inner) == 1 {
+            self.stop();
+        }
     }
 }
 
@@ -277,9 +284,13 @@ impl Default for RuntimeHostConfig {
 /// RuntimeHost: owns the (not yet started) CollectorRuntime and the handle.
 /// `start()` moves the collector into the worker thread — a second start is impossible
 /// by construction (HOST2 single worker).
+///
+/// The handle is `Arc`-wrapped so that dropping the `RuntimeHost` itself (e.g. at the end
+/// of Tauri `setup`) NEVER stops the worker: `RuntimeHostHandle::drop` only fires when the
+/// LAST handle is dropped (the one managed by Tauri, at app exit).
 pub struct RuntimeHost {
     collector: Option<CollectorRuntime>,
-    handle: RuntimeHostHandle,
+    handle: Arc<RuntimeHostHandle>,
     tick_interval: Duration,
 }
 
@@ -315,20 +326,20 @@ impl RuntimeHost {
             CollectorRuntime::with_roots(runtime_config, codex_root, claude_root, zcode_root)?;
         Ok(Self {
             collector: Some(collector),
-            handle: RuntimeHostHandle {
-                shared: Arc::new(SharedState {
+            handle: Arc::new(RuntimeHostHandle {
+                inner: Arc::new(HostInner {
                     state: Mutex::new((RuntimeHostState::Starting, None)),
                     snapshot: RwLock::new(None),
                     join: Mutex::new(None),
+                    stop: StopSignal::new(),
                 }),
-                stop: Arc::new(StopSignal::new()),
-            },
+            }),
             tick_interval: config.tick_interval,
         })
     }
 
     pub fn handle(&self) -> RuntimeHostHandle {
-        self.handle.clone()
+        (*self.handle).clone()
     }
 
     /// Spawn the dedicated collector worker (single loop: observe -> tick -> publish -> wait).
@@ -339,49 +350,43 @@ impl RuntimeHost {
             .collector
             .take()
             .ok_or(HostStartError::AlreadyStarted)?;
-        let shared = self.handle.shared.clone();
-        let stop = self.handle.stop.clone();
+        let inner = self.handle.inner.clone();
         let tick_interval = self.tick_interval;
         let join = std::thread::Builder::new()
             .name("collector-worker".to_string())
-            .spawn(move || worker_loop(collector, shared, stop, tick_interval))
+            .spawn(move || worker_loop(collector, inner, tick_interval))
             .expect("failed to spawn collector worker");
-        *self.handle.shared.join.lock() = Some(join);
+        *self.handle.inner.join.lock() = Some(join);
         Ok(())
     }
 }
 
 /// The single collector loop. Runs `CollectorRuntime` exclusively on this thread.
-fn worker_loop(
-    mut collector: CollectorRuntime,
-    shared: Arc<SharedState>,
-    stop: Arc<StopSignal>,
-    tick_interval: Duration,
-) {
-    while !stop.is_requested() {
+fn worker_loop(mut collector: CollectorRuntime, inner: Arc<HostInner>, tick_interval: Duration) {
+    while !inner.stop.is_requested() {
         match collector.tick_once() {
             Ok(snapshot) => {
                 // External source degradation -> Degraded (NOT fatal); loop continues.
                 let state = host_state_from_health(&snapshot);
-                *shared.state.lock() = (state, None);
-                *shared.snapshot.write() = Some(RuntimePublicSnapshot::from_tick(&snapshot, state));
+                *inner.state.lock() = (state, None);
+                *inner.snapshot.write() = Some(RuntimePublicSnapshot::from_tick(&snapshot, state));
             }
             Err(e) => {
                 // Monitor durable failure (AdapterFatal) -> Fatal + stop the loop.
                 // External agent failures never produce Err (degraded health only).
                 let kind = sanitized_fatal_kind(&e);
-                *shared.state.lock() = (RuntimeHostState::Fatal, Some(kind));
+                *inner.state.lock() = (RuntimeHostState::Fatal, Some(kind));
                 // Clone FIRST so the read guard drops before the write (never read+write
                 // on the same thread — parking_lot RwLock would deadlock).
-                let last_snapshot = shared.snapshot.read().clone();
+                let last_snapshot = inner.snapshot.read().clone();
                 if let Some(last) = last_snapshot {
-                    *shared.snapshot.write() = Some(last.with_host_state(RuntimeHostState::Fatal));
+                    *inner.snapshot.write() = Some(last.with_host_state(RuntimeHostState::Fatal));
                 }
                 // V1: no auto-restart — a broken DB/disk must not restart-storm.
                 break;
             }
         }
-        stop.wait(tick_interval);
+        inner.stop.wait(tick_interval);
     }
 }
 

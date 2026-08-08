@@ -282,6 +282,20 @@ fn host2_single_worker() {
         ),
         "snapshot must keep advancing (worker alive)"
     );
+    // Dropping the RuntimeHost (e.g. end of Tauri setup) must NOT stop the worker while a
+    // managed handle is still alive (03B smoke-test regression: premature Drop::stop).
+    drop(host);
+    let s2 = handle.snapshot().unwrap();
+    assert!(
+        wait_for(
+            || handle
+                .snapshot()
+                .map(|s| s.wall_timestamp_ms > s2.wall_timestamp_ms)
+                .unwrap_or(false),
+            Duration::from_secs(5)
+        ),
+        "worker must survive host drop while a handle is alive"
+    );
     handle.stop();
     println!("SINGLE COLLECTOR WORKER = PASS");
     let _ = std::fs::remove_dir_all(&dir);
